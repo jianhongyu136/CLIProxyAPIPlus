@@ -14,6 +14,7 @@ import (
 	"syscall"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/toolemu"
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/crypto/bcrypt"
 	"gopkg.in/yaml.v3"
@@ -193,6 +194,10 @@ type Config struct {
 	// This is useful when you want to login with a different account without logging out
 	// from your current session. Default: false.
 	IncognitoBrowser bool `yaml:"incognito-browser" json:"incognito-browser"`
+
+	// ToolEmulation enables prompt-injection based tool-call emulation for
+	// upstream models that do not support native tool calling.
+	ToolEmulation toolemu.ToolEmulationConfig `yaml:"tool-emulation" json:"tool-emulation,omitempty"`
 
 	legacyMigrationPending bool `yaml:"-" json:"-"`
 }

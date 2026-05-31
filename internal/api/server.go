@@ -669,6 +669,8 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.PUT("/debug", s.mgmt.PutDebug)
 		mgmt.PATCH("/debug", s.mgmt.PutDebug)
 
+		mgmt.GET("/tool-emulation/status", s.mgmt.GetToolEmulationStatus)
+
 		mgmt.GET("/logging-to-file", s.mgmt.GetLoggingToFile)
 		mgmt.PUT("/logging-to-file", s.mgmt.PutLoggingToFile)
 		mgmt.PATCH("/logging-to-file", s.mgmt.PutLoggingToFile)

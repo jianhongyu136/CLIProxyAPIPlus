@@ -20,6 +20,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/redisqueue"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/toolemu"
 	kirocommon "github.com/router-for-me/CLIProxyAPI/v7/internal/translator/kiro/common"
 	internalusage "github.com/router-for-me/CLIProxyAPI/v7/internal/usage"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
@@ -1220,6 +1221,7 @@ func (s *Service) applyConfigUpdate(newCfg *config.Config) {
 	s.cfgMu.Lock()
 	s.cfg = newCfg
 	s.cfgMu.Unlock()
+	toolemu.Default.Replace(newCfg.ToolEmulation.DefaultsApplied())
 	if s.coreManager != nil {
 		s.coreManager.SetConfig(newCfg)
 		s.coreManager.SetOAuthModelAlias(newCfg.OAuthModelAlias)
@@ -1482,6 +1484,9 @@ func (s *Service) Run(ctx context.Context) error {
 
 	s.applyRetryConfig(s.cfg)
 	applyKiroRuntimeConfig(s.cfg)
+	if s.cfg != nil {
+		toolemu.Default.Replace(s.cfg.ToolEmulation.DefaultsApplied())
+	}
 
 	s.registerPluginAuthParser()
 	if s.coreManager != nil && !homeEnabled {

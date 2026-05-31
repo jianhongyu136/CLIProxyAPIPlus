@@ -21,6 +21,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/signature"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/toolemu"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
@@ -822,6 +823,29 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	reporter.SetTranslatedReasoningEffort(body, to.String())
 
 	url := strings.TrimSuffix(baseURL, "/") + "/responses"
+
+	if helps.ToolEmuActive(ctx, e.Identifier(), baseModel, requestedModel, body) {
+		policy := helps.ToolEmuRetryPolicy(e.cfg.ToolEmulation)
+		send := e.buildCodexToolEmuSend(from, auth, req, originalPayloadSource, url, apiKey, replayScope)
+		outcome, errEmu := helps.RunToolEmu(ctx, body, toolemu.ShapeOpenAIResponses, e.Identifier(), policy, send)
+		if errEmu != nil {
+			return resp, errEmu
+		}
+		// Wrap built body back into the Codex SSE response.completed envelope so the
+		// existing Codex translator picks up the standard "response.output" shape.
+		wrapped := []byte(`{"type":"response.completed"}`)
+		wrapped, _ = sjson.SetRawBytes(wrapped, "response", outcome.BuiltBody)
+		if detail, ok := helps.ParseCodexUsage(wrapped); ok {
+			reporter.Publish(ctx, detail)
+		}
+		cacheCodexReasoningReplayFromCompleted(replayScope, wrapped)
+		reporter.EnsurePublished(ctx)
+		var param any
+		out := sdktranslator.TranslateNonStream(ctx, to, from, req.Model, originalPayload, outcome.Folded, wrapped, &param)
+		resp = cliproxyexecutor.Response{Payload: out}
+		return resp, nil
+	}
+
 	var identityState codexIdentityConfuseState
 	httpReq, upstreamBody, identityState, err := e.cacheHelper(ctx, from, url, auth, req, originalPayloadSource, body)
 	if err != nil {
@@ -1099,6 +1123,112 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	reporter.SetTranslatedReasoningEffort(body, to.String())
 
 	url := strings.TrimSuffix(baseURL, "/") + "/responses"
+
+	if helps.ToolEmuActive(ctx, e.Identifier(), baseModel, requestedModel, body) {
+		choice := toolemu.ExtractToolChoice(body, toolemu.ShapeOpenAIResponses)
+		folded, errFold := toolemu.FoldRequest(body, toolemu.FoldOpts{Shape: toolemu.ShapeOpenAIResponses, Provider: e.Identifier()})
+		if errFold != nil {
+			return nil, errFold
+		}
+		var identityState codexIdentityConfuseState
+		httpReq, upstreamBody, identityState, errReq := e.cacheHelper(ctx, from, url, auth, req, originalPayloadSource, folded)
+		if errReq != nil {
+			return nil, errReq
+		}
+		applyCodexHeaders(httpReq, auth, apiKey, true, e.cfg)
+		applyCodexIdentityConfuseHeaders(httpReq.Header, &identityState)
+		var authID, authLabel, authType, authValue string
+		if auth != nil {
+			authID = auth.ID
+			authLabel = auth.Label
+			authType, authValue = auth.AccountInfo()
+		}
+		helps.RecordAPIRequest(ctx, e.cfg, helps.UpstreamRequestLog{
+			URL:       url,
+			Method:    http.MethodPost,
+			Headers:   httpReq.Header.Clone(),
+			Body:      upstreamBody,
+			Provider:  e.Identifier(),
+			AuthID:    authID,
+			AuthLabel: authLabel,
+			AuthType:  authType,
+			AuthValue: authValue,
+		})
+		httpClient := helps.NewUtlsHTTPClient(ctx, e.cfg, auth, 0)
+		httpClient = reporter.TrackHTTPClient(httpClient)
+		httpResp, errDo := httpClient.Do(httpReq)
+		if errDo != nil {
+			helps.RecordAPIResponseError(ctx, e.cfg, errDo)
+			return nil, errDo
+		}
+		helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
+		if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
+			data, readErr := io.ReadAll(httpResp.Body)
+			if errClose := httpResp.Body.Close(); errClose != nil {
+				log.Errorf("codex executor: close response body error: %v", errClose)
+			}
+			if readErr != nil {
+				helps.RecordAPIResponseError(ctx, e.cfg, readErr)
+				return nil, readErr
+			}
+			data = applyCodexIdentityConfuseResponsePayload(data, identityState)
+			clearCodexReasoningReplayOnInvalidSignature(replayScope, httpResp.StatusCode, data)
+			helps.AppendAPIResponseChunk(ctx, e.cfg, data)
+			helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), data))
+			err = newCodexStatusErr(httpResp.StatusCode, data)
+			return nil, err
+		}
+		ctx = toolemu.MarkFolded(ctx, true)
+		out := make(chan cliproxyexecutor.StreamChunk)
+		go func() {
+			defer close(out)
+			defer func() {
+				if errClose := httpResp.Body.Close(); errClose != nil {
+					log.Errorf("codex executor: close response body error: %v", errClose)
+				}
+			}()
+			var param any
+			meta := toolemu.UpstreamMeta{Provider: e.Identifier(), Model: baseModel}
+			upMeta, errStream := helps.RunToolEmuStream(ctx, meta, toolemu.ShapeOpenAIResponses, httpResp.Body, choice, func(frame []byte) {
+				upstreamFrame := applyCodexIdentityConfuseResponsePayload(frame, identityState)
+				helps.AppendAPIResponseChunk(ctx, e.cfg, upstreamFrame)
+				translatedFrame := applyCodexIdentityExposeResponsePayload(upstreamFrame, identityState)
+				if bytes.HasPrefix(translatedFrame, dataTag) {
+					data := bytes.TrimSpace(translatedFrame[5:])
+					if gjson.GetBytes(data, "type").String() == "response.completed" {
+						cacheCodexReasoningReplayFromCompleted(replayScope, data)
+					}
+				}
+				chunks := sdktranslator.TranslateStream(ctx, to, from, req.Model, originalPayload, folded, translatedFrame, &param)
+				for i := range chunks {
+					select {
+					case out <- cliproxyexecutor.StreamChunk{Payload: chunks[i]}:
+					case <-ctx.Done():
+						return
+					}
+				}
+			})
+			if len(upMeta.UsagePayload) > 0 {
+				wrapped := []byte(`{"type":"response.completed"}`)
+				wrapped, _ = sjson.SetRawBytes(wrapped, "response.usage", upMeta.UsagePayload)
+				if detail, ok := helps.ParseCodexUsage(wrapped); ok {
+					reporter.Publish(ctx, detail)
+				}
+			}
+			if errStream != nil {
+				helps.RecordAPIResponseError(ctx, e.cfg, errStream)
+				reporter.PublishFailure(ctx, errStream)
+				select {
+				case out <- cliproxyexecutor.StreamChunk{Err: errStream}:
+				case <-ctx.Done():
+				}
+				return
+			}
+			reporter.EnsurePublished(ctx)
+		}()
+		return &cliproxyexecutor.StreamResult{Headers: httpResp.Header.Clone(), Chunks: out}, nil
+	}
+
 	var identityState codexIdentityConfuseState
 	httpReq, upstreamBody, identityState, err := e.cacheHelper(ctx, from, url, auth, req, originalPayloadSource, body)
 	if err != nil {
@@ -1861,4 +1991,91 @@ func (e *CodexExecutor) resolveCodexConfig(auth *cliproxyauth.Auth) *config.Code
 		}
 	}
 	return nil
+}
+
+// buildCodexToolEmuSend returns an UpstreamSendFunc closure for toolemu. The
+// closure POSTs the (possibly retried) body to the Codex /responses endpoint,
+// reads the full SSE stream, locates the response.completed event, patches the
+// response.output field with items collected from response.output_item.done and
+// returns the unwrapped response object so toolemu can ExtractAssistantText.
+func (e *CodexExecutor) buildCodexToolEmuSend(from sdktranslator.Format, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, userPayload []byte, url, apiKey string, replayScope codexReasoningReplayScope) toolemu.UpstreamSendFunc {
+	provider := e.Identifier()
+	return func(sctx context.Context, body []byte) ([]byte, error) {
+		httpReq, upstreamBody, identityState, errReq := e.cacheHelper(sctx, from, url, auth, req, userPayload, body)
+		if errReq != nil {
+			return nil, errReq
+		}
+		applyCodexHeaders(httpReq, auth, apiKey, true, e.cfg)
+		applyCodexIdentityConfuseHeaders(httpReq.Header, &identityState)
+		var authID, authLabel, authType, authValue string
+		if auth != nil {
+			authID = auth.ID
+			authLabel = auth.Label
+			authType, authValue = auth.AccountInfo()
+		}
+		helps.RecordAPIRequest(sctx, e.cfg, helps.UpstreamRequestLog{
+			URL:       url,
+			Method:    http.MethodPost,
+			Headers:   httpReq.Header.Clone(),
+			Body:      upstreamBody,
+			Provider:  provider,
+			AuthID:    authID,
+			AuthLabel: authLabel,
+			AuthType:  authType,
+			AuthValue: authValue,
+		})
+		client := helps.NewUtlsHTTPClient(sctx, e.cfg, auth, 0)
+		httpResp, errDo := client.Do(httpReq)
+		if errDo != nil {
+			helps.RecordAPIResponseError(sctx, e.cfg, errDo)
+			return nil, errDo
+		}
+		defer func() {
+			if errClose := httpResp.Body.Close(); errClose != nil {
+				log.Errorf("codex executor: close response body error: %v", errClose)
+			}
+		}()
+		helps.RecordAPIResponseMetadata(sctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
+		data, errRead := io.ReadAll(httpResp.Body)
+		if errRead != nil {
+			helps.RecordAPIResponseError(sctx, e.cfg, errRead)
+			return nil, errRead
+		}
+		data = applyCodexIdentityConfuseResponsePayload(data, identityState)
+		helps.AppendAPIResponseChunk(sctx, e.cfg, data)
+		if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
+			clearCodexReasoningReplayOnInvalidSignature(replayScope, httpResp.StatusCode, data)
+			return nil, newCodexStatusErr(httpResp.StatusCode, data)
+		}
+
+		lines := bytes.Split(data, []byte("\n"))
+		outputItemsByIndex := make(map[int64][]byte)
+		var outputItemsFallback [][]byte
+		for _, line := range lines {
+			if !bytes.HasPrefix(line, dataTag) {
+				continue
+			}
+			eventData := bytes.TrimSpace(line[5:])
+			if streamErr, terminalBody, ok := codexTerminalStreamErr(eventData); ok {
+				clearCodexReasoningReplayOnInvalidSignature(replayScope, streamErr.StatusCode(), terminalBody)
+				return nil, streamErr
+			}
+			eventType := gjson.GetBytes(eventData, "type").String()
+			if eventType == "response.output_item.done" {
+				collectCodexOutputItemDone(eventData, outputItemsByIndex, &outputItemsFallback)
+				continue
+			}
+			if eventType != "response.completed" {
+				continue
+			}
+			completed := patchCodexCompletedOutput(eventData, outputItemsByIndex, outputItemsFallback)
+			completed = applyCodexIdentityExposeResponsePayload(completed, identityState)
+			respNode := gjson.GetBytes(completed, "response")
+			if !respNode.Exists() {
+				return completed, nil
+			}
+			return []byte(respNode.Raw), nil
+		}
+		return nil, statusErr{code: 408, msg: "codex executor: stream closed before response.completed"}
+	}
 }

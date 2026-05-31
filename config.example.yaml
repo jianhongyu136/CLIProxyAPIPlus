@@ -548,3 +548,20 @@ nonstream-keepalive-interval: 0
 #       params: # JSON paths (gjson/sjson syntax) to remove from the payload
 #         - "generationConfig.thinkingConfig.thinkingBudget"
 #         - "generationConfig.responseJsonSchema"
+
+# Optional: tool-call prompt-injection emulation.
+# When enabled, requests targeting the listed (provider, model) pairs have their
+# `tools`/`tool_choice` folded into the system prompt and any <tool_call>
+# blocks emitted by the model are parsed back into structured tool calls so
+# downstream OpenAI/Responses clients see native tool-calling behavior on
+# upstream models that lack native support.
+# tool-emulation:
+#   enabled: false
+#   parse-retry: 1                       # extra attempts after the first; 0 disables retry
+#   on-parse-failure: parse_failed_to_content   # or "error"
+#   rules:
+#     # First-match-wins. Provider matches the executor identifier; models/model-aliases
+#     # accept glob patterns (filepath.Match). An empty models/model-aliases array means
+#     # "match all models for this provider".
+#     - provider: openai-compatibility
+#       models: ["*"]

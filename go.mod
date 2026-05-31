@@ -37,6 +37,7 @@ require (
 
 require (
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
+	github.com/tailscale/hujson v0.0.0-20260302212456-ecc657c15afd // indirect
 	go.uber.org/atomic v1.11.0 // indirect
 )
 
