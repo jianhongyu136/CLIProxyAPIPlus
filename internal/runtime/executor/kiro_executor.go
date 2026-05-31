@@ -1018,6 +1018,8 @@ func (e *KiroExecutor) executeWithRetry(ctx context.Context, auth *cliproxyauth.
 			// Build response in Claude format for Kiro translator
 			// stopReason is extracted from upstream response by parseEventStream
 			requestedModel := payloadRequestedModel(opts, req.Model)
+			// Strip placeholder markers the model may have parroted from history
+			content = kirocommon.StripPlaceholderMarkers(content)
 			kiroResponse := kiroclaude.BuildClaudeResponse(content, toolUses, requestedModel, usageInfo, stopReason)
 			out := sdktranslator.TranslateNonStream(ctx, to, from, requestedModel, bytes.Clone(opts.OriginalRequest), body, kiroResponse, nil)
 			resp = cliproxyexecutor.Response{Payload: []byte(out)}
@@ -2837,6 +2839,12 @@ func (e *KiroExecutor) streamToChannel(ctx context.Context, body io.Reader, out 
 			}
 
 			// Handle text content with thinking mode support
+			if contentDelta != "" {
+				// Strip placeholder markers the model may parrot from history
+				// (e.g. "[tool_call]" injected for empty assistant content).
+				// Must happen before token counting and all emit paths.
+				contentDelta = kirocommon.StripPlaceholderMarkers(contentDelta)
+			}
 			if contentDelta != "" {
 				// NOTE: Duplicate content filtering was removed because it incorrectly
 				// filtered out legitimate repeated content (like consecutive newlines "\n\n").

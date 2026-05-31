@@ -275,11 +275,26 @@ func BuildKiroPayloadFromOpenAI(openaiBody []byte, modelID, profileArn, origin s
 			fallbackContent = kirocommon.DefaultUserContent
 			log.Debugf("kiro-openai: fallback user message content was empty, using default: %s", fallbackContent)
 		}
-		currentMessage = KiroCurrentMessage{UserInputMessage: KiroUserInputMessage{
+		fallbackUserMsg := KiroUserInputMessage{
 			Content: fallbackContent,
 			ModelID: modelID,
 			Origin:  origin,
-		}}
+		}
+		// CRITICAL: when history contains tool turns, Kiro requires
+		// currentMessage.userInputMessageContext.tools to be non-empty.
+		// The fallback path must also synthesize stub tools from history.
+		if len(kiroTools) == 0 && !isChatOnly {
+			kiroTools = synthesizeToolSpecsFromHistory(history)
+			if len(kiroTools) > 0 {
+				log.Infof("kiro-openai: fallback path: synthesized %d stub tool spec(s) from history", len(kiroTools))
+			}
+		}
+		if len(kiroTools) > 0 {
+			fallbackUserMsg.UserInputMessageContext = &KiroUserInputMessageContext{
+				Tools: kiroTools,
+			}
+		}
+		currentMessage = KiroCurrentMessage{UserInputMessage: fallbackUserMsg}
 	}
 
 	// Session IDs: extract from messages[].additional_kwargs (LangChain format) or random

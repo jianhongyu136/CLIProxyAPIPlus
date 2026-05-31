@@ -1,7 +1,10 @@
 // Package common provides shared constants and utilities for Kiro translator.
 package common
 
-import "sync/atomic"
+import (
+	"strings"
+	"sync/atomic"
+)
 
 const (
 	// KiroMaxToolDescLen is the maximum description length for Kiro API tools.
@@ -176,4 +179,24 @@ func SetExtractThinkingTagEnabled(enabled bool) {
 // IsExtractThinkingTagEnabled reports whether inline <thinking> tag extraction is active.
 func IsExtractThinkingTagEnabled() bool {
 	return extractThinkingTagEnabled.Load() == 1
+}
+
+// placeholderMarkers lists all bracketed placeholder strings that are injected
+// into Kiro history to satisfy the non-empty content requirement. The model
+// sometimes parrots these back; they must be stripped from responses.
+var placeholderMarkers = []string{
+	DefaultAssistantContentWithTools,  // [tool_call]
+	DefaultAssistantContent,           // [empty]
+	DefaultUserContentWithToolResults, // [tool_result]
+	DefaultUserContent,                // [continue]
+}
+
+// StripPlaceholderMarkers removes known placeholder strings from response
+// content. Returns the cleaned string. This prevents the model from echoing
+// structural markers (e.g. "[tool_call]") that were injected into history.
+func StripPlaceholderMarkers(s string) string {
+	for _, marker := range placeholderMarkers {
+		s = strings.ReplaceAll(s, marker, "")
+	}
+	return s
 }
