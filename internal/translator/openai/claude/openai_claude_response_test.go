@@ -364,3 +364,52 @@ func TestStreamingTool_StopReasonMixedSuppressedAndValid(t *testing.T) {
 		t.Fatalf("stop_reason = %q, want %q", got, "tool_use")
 	}
 }
+
+func TestConvertOpenAIResponseToClaudeNonStream_MergesArrayReasoningIntoSingleThinking(t *testing.T) {
+	originalRequest := []byte(`{}`)
+	response := []byte(`{
+		"id":"chatcmpl_1",
+		"model":"m",
+		"choices":[{
+			"index":0,
+			"message":{
+				"role":"assistant",
+				"content":"final answer",
+				"reasoning_content":[
+					{"text":"first segment"},
+					{"text":"second segment"},
+					{"text":"third segment"}
+				]
+			},
+			"finish_reason":"stop"
+		}]
+	}`)
+
+	out := ConvertOpenAIResponseToClaudeNonStream(
+		context.Background(),
+		"",
+		originalRequest,
+		nil,
+		response,
+		nil,
+	)
+	parsed := gjson.ParseBytes(out)
+
+	thinkingCount := 0
+	var thinkingText string
+	parsed.Get("content").ForEach(func(_, item gjson.Result) bool {
+		if item.Get("type").String() == "thinking" {
+			thinkingCount++
+			thinkingText = item.Get("thinking").String()
+		}
+		return true
+	})
+
+	if thinkingCount != 1 {
+		t.Fatalf("expected exactly one thinking block for array reasoning_content, got %d (out=%s)", thinkingCount, string(out))
+	}
+	want := "first segment\n\nsecond segment\n\nthird segment"
+	if thinkingText != want {
+		t.Fatalf("thinking text = %q, want %q", thinkingText, want)
+	}
+}

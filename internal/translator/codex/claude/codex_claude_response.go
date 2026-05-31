@@ -29,9 +29,14 @@ type ConvertCodexResponseToClaudeParams struct {
 	HasTextDelta              bool
 	TextBlockOpen             bool
 	ThinkingBlockOpen         bool
-	ThinkingStopPending       bool
 	ThinkingSignature         string
 	ThinkingSummarySeen       bool
+	// ThinkingSummaryParts counts how many summary parts have started inside
+	// the current reasoning item. OpenAI Responses splits a single reasoning
+	// item into multiple summary parts; we coalesce them into a single Claude
+	// thinking block and use this counter to insert a paragraph separator
+	// (\n\n) at part boundaries.
+	ThinkingSummaryParts int
 }
 
 // ConvertCodexResponseToClaude performs sophisticated streaming response format conversion.
@@ -66,12 +71,6 @@ func ConvertCodexResponseToClaude(_ context.Context, _ string, originalRequestRa
 	output := make([]byte, 0, 512)
 	rootResult := gjson.ParseBytes(rawJSON)
 	params := (*param).(*ConvertCodexResponseToClaudeParams)
-	if params.ThinkingBlockOpen && params.ThinkingStopPending {
-		switch rootResult.Get("type").String() {
-		case "response.content_part.added", "response.completed", "response.incomplete":
-			output = append(output, finalizeCodexThinkingBlock(params)...)
-		}
-	}
 
 	typeResult := rootResult.Get("type")
 	typeStr := typeResult.String()
@@ -87,11 +86,20 @@ func ConvertCodexResponseToClaude(_ context.Context, _ string, originalRequestRa
 
 		output = translatorcommon.AppendSSEEventBytes(output, "message_start", template, 2)
 	case "response.reasoning_summary_part.added":
-		if params.ThinkingBlockOpen && params.ThinkingStopPending {
-			output = append(output, finalizeCodexThinkingBlock(params)...)
-		}
+		// OpenAI Responses splits a single reasoning item into multiple summary
+		// parts. Coalesce them into one Claude thinking content block; emit a
+		// paragraph separator at part boundaries so the merged text remains
+		// readable. The block is finalized only when the reasoning item ends
+		// or a non-thinking block (tool_use / text) starts.
 		params.ThinkingSummarySeen = true
-		output = append(output, startCodexThinkingBlock(params)...)
+		if !params.ThinkingBlockOpen {
+			output = append(output, startCodexThinkingBlock(params)...)
+		} else if params.ThinkingSummaryParts > 0 {
+			separator := []byte(`{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"\n\n"}}`)
+			separator, _ = sjson.SetBytes(separator, "index", params.BlockIndex)
+			output = translatorcommon.AppendSSEEventBytes(output, "content_block_delta", separator, 2)
+		}
+		params.ThinkingSummaryParts++
 	case "response.reasoning_summary_text.delta":
 		template = []byte(`{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":""}}`)
 		template, _ = sjson.SetBytes(template, "index", params.BlockIndex)
@@ -99,7 +107,8 @@ func ConvertCodexResponseToClaude(_ context.Context, _ string, originalRequestRa
 
 		output = translatorcommon.AppendSSEEventBytes(output, "content_block_delta", template, 2)
 	case "response.reasoning_summary_part.done":
-		params.ThinkingStopPending = true
+		// No-op: the thinking block stays open across parts and is finalized
+		// when the reasoning item ends or another block type starts.
 	case "response.content_part.added":
 		template = []byte(`{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`)
 		template, _ = sjson.SetBytes(template, "index", params.BlockIndex)
@@ -121,6 +130,12 @@ func ConvertCodexResponseToClaude(_ context.Context, _ string, originalRequestRa
 
 		output = translatorcommon.AppendSSEEventBytes(output, "content_block_stop", template, 2)
 	case "response.completed", "response.incomplete":
+		if params.ThinkingBlockOpen {
+			output = append(output, finalizeCodexThinkingBlock(params)...)
+			params.ThinkingSignature = ""
+			params.ThinkingSummarySeen = false
+			params.ThinkingSummaryParts = 0
+		}
 		template = []byte(`{"type":"message_delta","delta":{"stop_reason":"tool_use","stop_sequence":null},"usage":{"input_tokens":0,"output_tokens":0}}`)
 		responseData := rootResult.Get("response")
 		template, _ = sjson.SetBytes(template, "delta.stop_reason", mapCodexStopReasonToClaude(codexStopReason(responseData), params.HasToolCall))
@@ -162,6 +177,7 @@ func ConvertCodexResponseToClaude(_ context.Context, _ string, originalRequestRa
 			output = translatorcommon.AppendSSEEventBytes(output, "content_block_delta", template, 2)
 		case "reasoning":
 			params.ThinkingSummarySeen = false
+			params.ThinkingSummaryParts = 0
 			params.ThinkingSignature = itemResult.Get("encrypted_content").String()
 		}
 	case "response.output_item.done":
@@ -227,6 +243,7 @@ func ConvertCodexResponseToClaude(_ context.Context, _ string, originalRequestRa
 			}
 			params.ThinkingSignature = ""
 			params.ThinkingSummarySeen = false
+			params.ThinkingSummaryParts = 0
 		}
 	case "response.function_call_arguments.delta":
 		params.HasReceivedArgumentsDelta = true
@@ -513,7 +530,6 @@ func startCodexThinkingBlock(params *ConvertCodexResponseToClaudeParams) []byte 
 	template := []byte(`{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}`)
 	template, _ = sjson.SetBytes(template, "index", params.BlockIndex)
 	params.ThinkingBlockOpen = true
-	params.ThinkingStopPending = false
 
 	return translatorcommon.AppendSSEEventBytes(nil, "content_block_start", template, 2)
 }
@@ -547,7 +563,7 @@ func finalizeCodexThinkingBlock(params *ConvertCodexResponseToClaudeParams) []by
 
 	params.BlockIndex++
 	params.ThinkingBlockOpen = false
-	params.ThinkingStopPending = false
+	params.ThinkingSummaryParts = 0
 
 	return output
 }

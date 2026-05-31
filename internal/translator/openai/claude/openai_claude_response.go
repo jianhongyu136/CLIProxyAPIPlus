@@ -428,12 +428,10 @@ func convertOpenAINonStreamingToAnthropic(rawJSON []byte) [][]byte {
 		choice := choices.Array()[0] // Take first choice
 
 		reasoningNode := choice.Get("message.reasoning_content")
-		for _, reasoningText := range collectOpenAIReasoningTexts(reasoningNode) {
-			if reasoningText == "" {
-				continue
-			}
+		reasoningTexts := collectOpenAIReasoningTexts(reasoningNode)
+		if merged := joinReasoningTexts(reasoningTexts); merged != "" {
 			block := []byte(`{"type":"thinking","thinking":""}`)
-			block, _ = sjson.SetBytes(block, "thinking", reasoningText)
+			block, _ = sjson.SetBytes(block, "thinking", merged)
 			out, _ = sjson.SetRawBytes(out, "content.-1", block)
 		}
 
@@ -545,6 +543,28 @@ func collectOpenAIReasoningTexts(node gjson.Result) []string {
 	}
 
 	return texts
+}
+
+// joinReasoningTexts merges multiple reasoning segments into a single string
+// separated by blank lines. OpenAI-compatible providers may split a single
+// reasoning trace across array entries; downstream Claude clients render one
+// thinking block per content entry, so we coalesce the segments to avoid
+// emitting fragmented thinking blocks for what is logically one trace.
+func joinReasoningTexts(texts []string) string {
+	if len(texts) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	for _, t := range texts {
+		if t == "" {
+			continue
+		}
+		if b.Len() > 0 {
+			b.WriteString("\n\n")
+		}
+		b.WriteString(t)
+	}
+	return b.String()
 }
 
 func stopThinkingContentBlock(param *ConvertOpenAIResponseToAnthropicParams, results *[][]byte) {
@@ -712,12 +732,9 @@ func ConvertOpenAIResponseToClaudeNonStream(_ context.Context, _ string, origina
 			}
 
 			if reasoning := message.Get("reasoning_content"); reasoning.Exists() {
-				for _, reasoningText := range collectOpenAIReasoningTexts(reasoning) {
-					if reasoningText == "" {
-						continue
-					}
+				if merged := joinReasoningTexts(collectOpenAIReasoningTexts(reasoning)); merged != "" {
 					block := []byte(`{"type":"thinking","thinking":""}`)
-					block, _ = sjson.SetBytes(block, "thinking", reasoningText)
+					block, _ = sjson.SetBytes(block, "thinking", merged)
 					out, _ = sjson.SetRawBytes(out, "content.-1", block)
 				}
 			}

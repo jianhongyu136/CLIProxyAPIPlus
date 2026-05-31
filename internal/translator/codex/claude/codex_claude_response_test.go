@@ -170,16 +170,20 @@ func TestConvertCodexResponseToClaude_StreamThinkingWithoutReasoningItemStillInc
 	}
 }
 
-func TestConvertCodexResponseToClaude_StreamThinkingFinalizesPendingBlockBeforeNextSummaryPart(t *testing.T) {
+func TestConvertCodexResponseToClaude_StreamThinkingMergesMultipleSummaryParts(t *testing.T) {
 	ctx := context.Background()
 	originalRequest := []byte(`{"messages":[]}`)
 	var param any
 
 	chunks := [][]byte{
+		[]byte("data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"reasoning\",\"encrypted_content\":\"enc_sig\"}}"),
 		[]byte("data: {\"type\":\"response.reasoning_summary_part.added\"}"),
 		[]byte("data: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"First part\"}"),
 		[]byte("data: {\"type\":\"response.reasoning_summary_part.done\"}"),
 		[]byte("data: {\"type\":\"response.reasoning_summary_part.added\"}"),
+		[]byte("data: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"Second part\"}"),
+		[]byte("data: {\"type\":\"response.reasoning_summary_part.done\"}"),
+		[]byte("data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"reasoning\"}}"),
 	}
 
 	var outputs [][]byte
@@ -187,28 +191,45 @@ func TestConvertCodexResponseToClaude_StreamThinkingFinalizesPendingBlockBeforeN
 		outputs = append(outputs, ConvertCodexResponseToClaude(ctx, "", originalRequest, nil, chunk, &param)...)
 	}
 
-	startCount := 0
-	stopCount := 0
+	thinkingStartCount := 0
+	thinkingStopCount := 0
+	signatureDeltaCount := 0
+	var thinkingDeltas []string
 	for _, out := range outputs {
 		for _, line := range strings.Split(string(out), "\n") {
 			if !strings.HasPrefix(line, "data: ") {
 				continue
 			}
 			data := gjson.Parse(strings.TrimPrefix(line, "data: "))
-			if data.Get("type").String() == "content_block_start" && data.Get("content_block.type").String() == "thinking" {
-				startCount++
-			}
-			if data.Get("type").String() == "content_block_stop" {
-				stopCount++
+			switch data.Get("type").String() {
+			case "content_block_start":
+				if data.Get("content_block.type").String() == "thinking" {
+					thinkingStartCount++
+				}
+			case "content_block_delta":
+				switch data.Get("delta.type").String() {
+				case "thinking_delta":
+					thinkingDeltas = append(thinkingDeltas, data.Get("delta.thinking").String())
+				case "signature_delta":
+					signatureDeltaCount++
+				}
+			case "content_block_stop":
+				thinkingStopCount++
 			}
 		}
 	}
 
-	if startCount != 2 {
-		t.Fatalf("expected 2 thinking block starts, got %d", startCount)
+	if thinkingStartCount != 1 {
+		t.Fatalf("expected exactly one thinking content_block_start across multiple summary parts, got %d", thinkingStartCount)
 	}
-	if stopCount != 1 {
-		t.Fatalf("expected pending thinking block to be finalized before second start, got %d stops", stopCount)
+	if thinkingStopCount != 1 {
+		t.Fatalf("expected exactly one content_block_stop for the merged thinking block, got %d", thinkingStopCount)
+	}
+	if signatureDeltaCount != 1 {
+		t.Fatalf("expected exactly one signature_delta for the merged thinking block, got %d", signatureDeltaCount)
+	}
+	if got, want := strings.Join(thinkingDeltas, ""), "First part\n\nSecond part"; got != want {
+		t.Fatalf("merged thinking text = %q, want %q", got, want)
 	}
 }
 
@@ -249,8 +270,8 @@ func TestConvertCodexResponseToClaude_StreamThinkingRetainsSignatureAcrossMultip
 		}
 	}
 
-	if signatureDeltaCount != 2 {
-		t.Fatalf("expected signature_delta for both multipart thinking blocks, got %d", signatureDeltaCount)
+	if signatureDeltaCount != 1 {
+		t.Fatalf("expected exactly one signature_delta on the merged thinking block, got %d", signatureDeltaCount)
 	}
 }
 
