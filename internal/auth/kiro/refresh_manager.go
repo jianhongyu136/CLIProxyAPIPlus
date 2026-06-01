@@ -296,6 +296,22 @@ func InitRateLimiterConfig(cfg *config.Config) {
 		}
 	}
 
+	// New retry/cooldown config fields
+	if krl.CooldownEnabled != nil {
+		rlCfg.CooldownEnabled = krl.CooldownEnabled
+	}
+	if krl.MaxRetriesOn429 > 0 {
+		rlCfg.MaxRetriesOn429 = krl.MaxRetriesOn429
+	}
+	if krl.RetryDelayOn429 != "" {
+		if d, err := time.ParseDuration(krl.RetryDelayOn429); err == nil && d > 0 {
+			rlCfg.RetryDelayOn429 = d
+		}
+	}
+	if krl.MaxEndpointRetries > 0 {
+		rlCfg.MaxEndpointRetries = krl.MaxEndpointRetries
+	}
+
 	SetGlobalRateLimiterConfig(rlCfg)
 }
 

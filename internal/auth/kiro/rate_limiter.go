@@ -71,6 +71,16 @@ type RateLimiterConfig struct {
 	BackoffMax        time.Duration
 	BackoffMultiplier float64
 	SuspendCooldown   time.Duration
+
+	// CooldownEnabled controls whether the CooldownManager is active (default: true).
+	// When set to false, cooldown is disabled and tokens are never blocked.
+	CooldownEnabled *bool
+	// MaxRetriesOn429 is the max retries on the same endpoint for 429 before switching (default: 0).
+	MaxRetriesOn429 int
+	// RetryDelayOn429 is the delay between 429 retries (default: 2s).
+	RetryDelayOn429 time.Duration
+	// MaxEndpointRetries overrides maxRetries per endpoint for auth/5xx errors (default: 2).
+	MaxEndpointRetries int
 }
 
 // NewRateLimiterWithConfig creates a rate limiter with custom settings.

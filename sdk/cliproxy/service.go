@@ -1214,6 +1214,7 @@ func (s *Service) applyConfigUpdate(newCfg *config.Config) {
 	}
 
 	s.applyRetryConfig(newCfg)
+	applyKiroRuntimeConfig(newCfg)
 	s.applyPprofConfig(newCfg)
 	if s.server != nil {
 		s.server.UpdateClients(newCfg)

@@ -743,6 +743,21 @@ type KiroRateLimitConfig struct {
 	BackoffMultiplier float64 `yaml:"backoff-multiplier,omitempty" json:"backoff-multiplier,omitempty"`
 	// SuspendCooldown is the cooldown duration after suspension detection (default: 1h).
 	SuspendCooldown string `yaml:"suspend-cooldown,omitempty" json:"suspend-cooldown,omitempty"`
+
+	// CooldownEnabled controls whether the cooldown mechanism is active (default: true).
+	// When false, tokens will never be placed in cooldown after 429 errors,
+	// allowing requests to keep retrying without being blocked.
+	CooldownEnabled *bool `yaml:"cooldown-enabled,omitempty" json:"cooldown-enabled,omitempty"`
+	// MaxRetriesOn429 is the maximum number of retry attempts when receiving 429 errors
+	// on the same endpoint before switching to the next endpoint (default: 0, meaning
+	// switch immediately). Set to a higher value to retry on the same endpoint.
+	MaxRetriesOn429 int `yaml:"max-retries-on-429,omitempty" json:"max-retries-on-429,omitempty"`
+	// RetryDelayOn429 is the delay between retries on 429 errors (default: "2s").
+	// Accepts Go duration strings (e.g., "1s", "5s", "30s").
+	RetryDelayOn429 string `yaml:"retry-delay-on-429,omitempty" json:"retry-delay-on-429,omitempty"`
+	// MaxEndpointRetries overrides the maximum retry attempts per endpoint for
+	// auth errors (401/403) and server errors (5xx). Default: 2.
+	MaxEndpointRetries int `yaml:"max-endpoint-retries,omitempty" json:"max-endpoint-retries,omitempty"`
 }
 
 // OpenAICompatibility represents the configuration for OpenAI API compatibility

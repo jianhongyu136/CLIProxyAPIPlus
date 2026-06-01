@@ -303,6 +303,17 @@ nonstream-keepalive-interval: 0
 #  backoff-max: "5m"            # maximum backoff duration cap (default: 5m)
 #  backoff-multiplier: 1.5      # exponential backoff multiplier (default: 1.5)
 #  suspend-cooldown: "1h"       # cooldown after suspension keywords detected (default: 1h)
+#  cooldown-enabled: true       # set to false to disable cooldown on 429 errors (default: true)
+#  max-retries-on-429: 0        # retries on same endpoint before switching on 429 (default: 0 = switch immediately)
+#  retry-delay-on-429: "2s"     # delay between 429 retries (default: 2s)
+#  max-endpoint-retries: 2      # max retries per endpoint for 401/403/5xx errors (default: 2)
+
+# Example: aggressive retry without cooldown (keep retrying on 429 indefinitely)
+#kiro-rate-limit:
+#  cooldown-enabled: false
+#  max-retries-on-429: 10
+#  retry-delay-on-429: "2s"
+#  max-endpoint-retries: 2
 
 # Controls whether system prompts are wrapped with --- SYSTEM PROMPT --- markers
 # and injected into Kiro user messages. Kiro/Amazon Q API has no native system

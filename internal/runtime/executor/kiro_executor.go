@@ -695,7 +695,9 @@ func (e *KiroExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 // tokenKey is used for rate limiting and cooldown tracking.
 func (e *KiroExecutor) executeWithRetry(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, accessToken, profileArn string, kiroPayload, body []byte, from, to sdktranslator.Format, reporter *usageReporter, currentOrigin, kiroModelID string, isAgentic, isChatOnly bool, tokenKey string) (cliproxyexecutor.Response, error) {
 	var resp cliproxyexecutor.Response
-	maxRetries := 2 // Allow retries for token refresh + endpoint fallback
+	maxRetries := kiroauth.GetMaxEndpointRetries() // configurable, default 2
+	maxRetriesOn429 := kiroauth.GetMaxRetriesOn429()
+	retryDelayOn429 := kiroauth.GetRetryDelayOn429()
 	rateLimiter := kiroauth.GetGlobalRateLimiter()
 	cooldownMgr := kiroauth.GetGlobalCooldownManager()
 	endpointConfigs := getKiroEndpointConfigs(auth)
@@ -801,7 +803,7 @@ func (e *KiroExecutor) executeWithRetry(ctx context.Context, auth *cliproxyauth.
 			}
 			recordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
 
-			// Handle 429 errors (quota exhausted) - try next endpoint
+			// Handle 429 errors (quota exhausted) - retry or try next endpoint
 			// Each endpoint has its own quota pool, so we can try different endpoints
 			if httpResp.StatusCode == 429 {
 				respBody, _ := io.ReadAll(httpResp.Body)
@@ -816,6 +818,14 @@ func (e *KiroExecutor) executeWithRetry(ctx context.Context, auth *cliproxyauth.
 
 				// Preserve last 429 so callers can correctly backoff when all endpoints are exhausted
 				last429Err = statusErr{code: httpResp.StatusCode, msg: string(respBody)}
+
+				// If maxRetriesOn429 > 0, retry on the same endpoint before switching
+				if attempt < maxRetriesOn429 {
+					log.Warnf("kiro: 429 retry %d/%d on %s endpoint, waiting %v",
+						attempt+1, maxRetriesOn429, endpointConfig.Name, retryDelayOn429)
+					time.Sleep(retryDelayOn429)
+					continue
+				}
 
 				log.Warnf("kiro: %s endpoint quota exhausted (429), will try next endpoint, body: %s",
 					endpointConfig.Name, summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody))
@@ -1139,7 +1149,9 @@ func (e *KiroExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 // Also supports multi-endpoint fallback similar to Antigravity implementation.
 // tokenKey is used for rate limiting and cooldown tracking.
 func (e *KiroExecutor) executeStreamWithRetry(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, accessToken, profileArn string, kiroPayload, body []byte, from sdktranslator.Format, reporter *usageReporter, currentOrigin, kiroModelID string, isAgentic, isChatOnly bool, tokenKey string) (<-chan cliproxyexecutor.StreamChunk, error) {
-	maxRetries := 2 // Allow retries for token refresh + endpoint fallback
+	maxRetries := kiroauth.GetMaxEndpointRetries() // configurable, default 2
+	maxRetriesOn429 := kiroauth.GetMaxRetriesOn429()
+	retryDelayOn429 := kiroauth.GetRetryDelayOn429()
 	rateLimiter := kiroauth.GetGlobalRateLimiter()
 	cooldownMgr := kiroauth.GetGlobalCooldownManager()
 	endpointConfigs := getKiroEndpointConfigs(auth)
@@ -1232,7 +1244,7 @@ func (e *KiroExecutor) executeStreamWithRetry(ctx context.Context, auth *cliprox
 			}
 			recordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
 
-			// Handle 429 errors (quota exhausted) - try next endpoint
+			// Handle 429 errors (quota exhausted) - retry or try next endpoint
 			// Each endpoint has its own quota pool, so we can try different endpoints
 			if httpResp.StatusCode == 429 {
 				respBody, _ := io.ReadAll(httpResp.Body)
@@ -1247,6 +1259,14 @@ func (e *KiroExecutor) executeStreamWithRetry(ctx context.Context, auth *cliprox
 
 				// Preserve last 429 so callers can correctly backoff when all endpoints are exhausted
 				last429Err = statusErr{code: httpResp.StatusCode, msg: string(respBody)}
+
+				// If maxRetriesOn429 > 0, retry on the same endpoint before switching
+				if attempt < maxRetriesOn429 {
+					log.Warnf("kiro: stream 429 retry %d/%d on %s endpoint, waiting %v",
+						attempt+1, maxRetriesOn429, endpointConfig.Name, retryDelayOn429)
+					time.Sleep(retryDelayOn429)
+					continue
+				}
 
 				log.Warnf("kiro: stream %s endpoint quota exhausted (429), will try next endpoint, body: %s",
 					endpointConfig.Name, summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody))

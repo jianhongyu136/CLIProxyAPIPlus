@@ -19,6 +19,7 @@ type CooldownManager struct {
 	mu        sync.RWMutex
 	cooldowns map[string]time.Time
 	reasons   map[string]string
+	disabled  bool
 }
 
 func NewCooldownManager() *CooldownManager {
@@ -28,7 +29,18 @@ func NewCooldownManager() *CooldownManager {
 	}
 }
 
+// SetDisabled controls whether the cooldown manager is disabled.
+// When disabled, IsInCooldown always returns false and SetCooldown is a no-op.
+func (cm *CooldownManager) SetDisabled(disabled bool) {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	cm.disabled = disabled
+}
+
 func (cm *CooldownManager) SetCooldown(tokenKey string, duration time.Duration, reason string) {
+	if cm.disabled {
+		return
+	}
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
 	cm.cooldowns[tokenKey] = time.Now().Add(duration)
@@ -36,6 +48,9 @@ func (cm *CooldownManager) SetCooldown(tokenKey string, duration time.Duration, 
 }
 
 func (cm *CooldownManager) IsInCooldown(tokenKey string) bool {
+	if cm.disabled {
+		return false
+	}
 	cm.mu.RLock()
 	defer cm.mu.RUnlock()
 	endTime, exists := cm.cooldowns[tokenKey]
