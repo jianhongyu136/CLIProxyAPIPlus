@@ -225,6 +225,34 @@ func TestCodexExecutorCacheHelper_IdentityConfuseRemapsBodyAndHeaders(t *testing
 	}
 }
 
+func TestCodexInstallationIDGeneratedPerAuthWhenMissing(t *testing.T) {
+	cfg := &config.Config{}
+	clientBody := []byte(`{"model":"gpt-5-codex"}`)
+	rawJSON := []byte(`{"model":"gpt-5-codex","stream":true}`)
+
+	firstBody, firstState := applyCodexIdentityConfuseBody(cfg, &cliproxyauth.Auth{ID: "auth-1", Provider: "codex"}, clientBody, rawJSON)
+	secondBody, _ := applyCodexIdentityConfuseBody(cfg, &cliproxyauth.Auth{ID: "auth-1", Provider: "codex"}, clientBody, rawJSON)
+	otherBody, _ := applyCodexIdentityConfuseBody(cfg, &cliproxyauth.Auth{ID: "auth-2", Provider: "codex"}, clientBody, rawJSON)
+
+	expectedFirstID := uuid.NewSHA1(uuid.NameSpaceOID, []byte("cli-proxy-api:codex:installation:auth-1")).String()
+	firstID := gjson.GetBytes(firstBody, "client_metadata.x-codex-installation-id").String()
+	if firstID != expectedFirstID {
+		t.Fatalf("generated installation id = %q, want %q; body=%s", firstID, expectedFirstID, string(firstBody))
+	}
+	if secondID := gjson.GetBytes(secondBody, "client_metadata.x-codex-installation-id").String(); secondID != firstID {
+		t.Fatalf("generated installation id must be stable, second = %q, first = %q", secondID, firstID)
+	}
+	if otherID := gjson.GetBytes(otherBody, "client_metadata.x-codex-installation-id").String(); otherID == firstID || otherID == "" {
+		t.Fatalf("generated installation id must differ per auth, other = %q, first = %q", otherID, firstID)
+	}
+	if firstState.enabled {
+		t.Fatalf("identity confuse state enabled = true, want false when identity-confuse is disabled")
+	}
+	if gotClientID := gjson.GetBytes(clientBody, "client_metadata.x-codex-installation-id").String(); gotClientID != "" {
+		t.Fatalf("client payload was mutated with installation id %q", gotClientID)
+	}
+}
+
 func TestApplyCodexHeadersUsesAccountHeaderForOAuth(t *testing.T) {
 	httpReq := httptest.NewRequest("POST", "https://example.com/responses", nil)
 	auth := &cliproxyauth.Auth{
