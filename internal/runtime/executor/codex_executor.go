@@ -60,13 +60,26 @@ func collectCodexOutputItemDone(eventData []byte, outputItemsByIndex map[int64][
 	*outputItemsFallback = append(*outputItemsFallback, []byte(itemResult.Raw))
 }
 
+func codexSyntheticReasoningDone(eventData, previous []byte) []byte {
+	signature := gjson.GetBytes(eventData, "item.encrypted_content").String()
+	if signature == "" {
+		return previous
+	}
+	done := []byte(`{"type":"response.output_item.done","item":{"type":"reasoning"}}`)
+	done, _ = sjson.SetBytes(done, "item.encrypted_content", signature)
+	return done
+}
+
 func patchCodexCompletedOutput(eventData []byte, outputItemsByIndex map[int64][]byte, outputItemsFallback [][]byte) []byte {
 	outputResult := gjson.GetBytes(eventData, "response.output")
 	shouldPatchOutput := (!outputResult.Exists() || !outputResult.IsArray() || len(outputResult.Array()) == 0) && (len(outputItemsByIndex) > 0 || len(outputItemsFallback) > 0)
-	if !shouldPatchOutput {
-		return eventData
+	if shouldPatchOutput {
+		eventData, _ = sjson.SetRawBytes(eventData, "response.output", buildCodexOutputArray(outputItemsByIndex, outputItemsFallback))
 	}
+	return normalizeCodexCompletedReasoningOutput(eventData)
+}
 
+func buildCodexOutputArray(outputItemsByIndex map[int64][]byte, outputItemsFallback [][]byte) []byte {
 	indexes := make([]int64, 0, len(outputItemsByIndex))
 	for idx := range outputItemsByIndex {
 		indexes = append(indexes, idx)
@@ -82,29 +95,137 @@ func patchCodexCompletedOutput(eventData []byte, outputItemsByIndex map[int64][]
 	items = append(items, outputItemsFallback...)
 
 	outputArray := []byte("[]")
-	if len(items) > 0 {
-		var buf bytes.Buffer
-		totalLen := 2
-		for _, item := range items {
-			totalLen += len(item)
-		}
-		if len(items) > 1 {
-			totalLen += len(items) - 1
-		}
-		buf.Grow(totalLen)
-		buf.WriteByte('[')
-		for i, item := range items {
-			if i > 0 {
-				buf.WriteByte(',')
-			}
-			buf.Write(item)
-		}
-		buf.WriteByte(']')
-		outputArray = buf.Bytes()
+	if len(items) == 0 {
+		return outputArray
 	}
 
-	completedDataPatched, _ := sjson.SetRawBytes(eventData, "response.output", outputArray)
-	return completedDataPatched
+	var buf bytes.Buffer
+	totalLen := 2
+	for _, item := range items {
+		totalLen += len(item)
+	}
+	if len(items) > 1 {
+		totalLen += len(items) - 1
+	}
+	buf.Grow(totalLen)
+	buf.WriteByte('[')
+	for i, item := range items {
+		if i > 0 {
+			buf.WriteByte(',')
+		}
+		buf.Write(item)
+	}
+	buf.WriteByte(']')
+	return buf.Bytes()
+}
+
+func normalizeCodexCompletedReasoningOutput(eventData []byte) []byte {
+	output := gjson.GetBytes(eventData, "response.output")
+	if !output.IsArray() {
+		return eventData
+	}
+	normalized, changed := mergeCodexAdjacentReasoningItems(output.Array())
+	if !changed {
+		return eventData
+	}
+	patched, err := sjson.SetRawBytes(eventData, "response.output", normalized)
+	if err != nil {
+		return eventData
+	}
+	return patched
+}
+
+type codexReasoningOutputMerge struct {
+	item             []byte
+	texts            []string
+	encryptedContent string
+}
+
+func mergeCodexAdjacentReasoningItems(items []gjson.Result) ([]byte, bool) {
+	if len(items) == 0 {
+		return []byte("[]"), false
+	}
+
+	merged := make([][]byte, 0, len(items))
+	pending := codexReasoningOutputMerge{}
+	changed := false
+
+	flushReasoning := func() {
+		if len(pending.item) == 0 {
+			return
+		}
+		item := append([]byte(nil), pending.item...)
+		if pending.encryptedContent != "" {
+			item, _ = sjson.SetBytes(item, "encrypted_content", pending.encryptedContent)
+		}
+		if len(pending.texts) > 0 {
+			summary := []byte(`[{"type":"summary_text","text":""}]`)
+			summary, _ = sjson.SetBytes(summary, "0.text", strings.Join(pending.texts, "\n\n"))
+			item, _ = sjson.SetRawBytes(item, "summary", summary)
+		}
+		merged = append(merged, item)
+		pending = codexReasoningOutputMerge{}
+	}
+
+	for _, item := range items {
+		if strings.TrimSpace(item.Get("type").String()) != "reasoning" {
+			flushReasoning()
+			merged = append(merged, []byte(item.Raw))
+			continue
+		}
+		if len(pending.item) == 0 {
+			pending.item = []byte(item.Raw)
+		} else {
+			changed = true
+		}
+		if encryptedContent := item.Get("encrypted_content").String(); encryptedContent != "" {
+			pending.encryptedContent = encryptedContent
+		}
+		pending.texts = append(pending.texts, codexReasoningOutputTexts(item)...)
+	}
+	flushReasoning()
+
+	wrapper := []byte(`{"output":[]}`)
+	for _, item := range merged {
+		wrapper, _ = sjson.SetRawBytes(wrapper, "output.-1", item)
+	}
+	if changed {
+		return []byte(gjson.GetBytes(wrapper, "output").Raw), true
+	}
+	return []byte(gjson.GetBytes(wrapper, "output").Raw), false
+}
+
+func codexReasoningOutputTexts(item gjson.Result) []string {
+	texts := codexTextValues(item.Get("summary"))
+	if len(texts) > 0 {
+		return texts
+	}
+	return codexTextValues(item.Get("content"))
+}
+
+func codexTextValues(value gjson.Result) []string {
+	if !value.Exists() {
+		return nil
+	}
+	if value.IsArray() {
+		var texts []string
+		value.ForEach(func(_, part gjson.Result) bool {
+			texts = append(texts, codexTextValues(part)...)
+			return true
+		})
+		return texts
+	}
+	if text := value.Get("text"); text.Exists() {
+		if textString := text.String(); textString != "" {
+			return []string{textString}
+		}
+	}
+	if value.Type == gjson.String {
+		if textString := value.String(); textString != "" {
+			return []string{textString}
+		}
+	}
+	return nil
 }
 
 func codexTerminalStreamContextLengthErr(eventData []byte) (statusErr, bool) {
@@ -940,28 +1061,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 		}
 		publishCodexImageToolUsage(ctx, reporter, body, eventData)
 
-		completedData := eventData
-		outputResult := gjson.GetBytes(completedData, "response.output")
-		shouldPatchOutput := (!outputResult.Exists() || !outputResult.IsArray() || len(outputResult.Array()) == 0) && (len(outputItemsByIndex) > 0 || len(outputItemsFallback) > 0)
-		if shouldPatchOutput {
-			completedDataPatched := completedData
-			completedDataPatched, _ = sjson.SetRawBytes(completedDataPatched, "response.output", []byte(`[]`))
-
-			indexes := make([]int64, 0, len(outputItemsByIndex))
-			for idx := range outputItemsByIndex {
-				indexes = append(indexes, idx)
-			}
-			sort.Slice(indexes, func(i, j int) bool {
-				return indexes[i] < indexes[j]
-			})
-			for _, idx := range indexes {
-				completedDataPatched, _ = sjson.SetRawBytes(completedDataPatched, "response.output.-1", outputItemsByIndex[idx])
-			}
-			for _, item := range outputItemsFallback {
-				completedDataPatched, _ = sjson.SetRawBytes(completedDataPatched, "response.output.-1", item)
-			}
-			completedData = completedDataPatched
-		}
+		completedData := patchCodexCompletedOutput(eventData, outputItemsByIndex, outputItemsFallback)
 		cacheCodexReasoningReplayFromCompleted(replayScope, completedData)
 
 		var param any
@@ -1291,6 +1391,28 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		var param any
 		outputItemsByIndex := make(map[int64][]byte)
 		var outputItemsFallback [][]byte
+		mergeCodexReasoningStream := sourceFormatEqual(from, sdktranslator.FormatClaude)
+		var pendingReasoningDone []byte
+		emitTranslatedLine := func(translatedLine []byte) bool {
+			translatedLine = applyCodexIdentityExposeResponsePayload(translatedLine, identityState)
+			chunks := sdktranslator.TranslateStream(ctx, to, responseFormat, req.Model, originalPayload, body, translatedLine, &param)
+			for i := range chunks {
+				select {
+				case out <- cliproxyexecutor.StreamChunk{Payload: chunks[i]}:
+				case <-ctx.Done():
+					return false
+				}
+			}
+			return true
+		}
+		flushPendingReasoning := func() bool {
+			if len(pendingReasoningDone) == 0 {
+				return true
+			}
+			line := append([]byte("data: "), pendingReasoningDone...)
+			pendingReasoningDone = nil
+			return emitTranslatedLine(line)
+		}
 		for scanner.Scan() {
 			line := applyCodexIdentityConfuseResponsePayload(scanner.Bytes(), identityState)
 			helps.AppendAPIResponseChunk(ctx, e.cfg, line)
@@ -1308,10 +1430,31 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 					}
 					return
 				}
-				switch gjson.GetBytes(data, "type").String() {
+				eventType := gjson.GetBytes(data, "type").String()
+				switch eventType {
+				case "response.output_item.added":
+					if mergeCodexReasoningStream && gjson.GetBytes(data, "item.type").String() == "reasoning" {
+						pendingReasoningDone = codexSyntheticReasoningDone(data, pendingReasoningDone)
+						continue
+					}
+					if mergeCodexReasoningStream && !flushPendingReasoning() {
+						return
+					}
 				case "response.output_item.done":
 					collectCodexOutputItemDone(data, outputItemsByIndex, &outputItemsFallback)
-				case "response.completed":
+					if mergeCodexReasoningStream && gjson.GetBytes(data, "item.type").String() == "reasoning" {
+						pendingReasoningDone = append(pendingReasoningDone[:0], data...)
+						continue
+					}
+					if mergeCodexReasoningStream && !flushPendingReasoning() {
+						return
+					}
+				case "response.content_part.added", "response.output_text.delta", "response.function_call_arguments.delta", "response.completed", "response.incomplete":
+					if mergeCodexReasoningStream && !flushPendingReasoning() {
+						return
+					}
+				}
+				if eventType == "response.completed" {
 					if detail, ok := helps.ParseCodexUsage(data); ok {
 						reporter.Publish(ctx, detail)
 					}
@@ -1322,14 +1465,8 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 				}
 			}
 
-			translatedLine = applyCodexIdentityExposeResponsePayload(translatedLine, identityState)
-			chunks := sdktranslator.TranslateStream(ctx, to, responseFormat, req.Model, originalPayload, body, translatedLine, &param)
-			for i := range chunks {
-				select {
-				case out <- cliproxyexecutor.StreamChunk{Payload: chunks[i]}:
-				case <-ctx.Done():
-					return
-				}
+			if !emitTranslatedLine(translatedLine) {
+				return
 			}
 		}
 		if errScan := scanner.Err(); errScan != nil {
