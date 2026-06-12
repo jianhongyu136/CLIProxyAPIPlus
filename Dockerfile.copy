@@ -1,9 +1,11 @@
 FROM kaitranntt/cli-proxy-api-plus:latest AS builder
 
-FROM alpine:3.23.0
+FROM debian:bookworm-slim
 
-RUN apk add --no-cache nginx gettext tzdata \
-    && adduser -D -u 1000 appuser \
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends nginx gettext-base tzdata ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd -u 1000 -m -s /bin/sh appuser \
     && mkdir -p /app/data /app/docker /run/nginx /tmp/nginx /tmp/nginx/client_body /tmp/nginx/proxy /tmp/nginx/fastcgi /tmp/nginx/uwsgi /tmp/nginx/scgi \
     && chown -R appuser:appuser /app /run/nginx /tmp/nginx
 
