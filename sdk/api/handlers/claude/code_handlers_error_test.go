@@ -1,13 +1,18 @@
 package claude
 
 import (
+	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
+	sdkconfig "github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
 	"github.com/tidwall/gjson"
 )
 
@@ -90,5 +95,50 @@ func TestPendingClaudeStreamErrorUsesBufferedError(t *testing.T) {
 	}
 	if gotErr != wantErr {
 		t.Fatalf("pending error = %p, want %p", gotErr, wantErr)
+	}
+}
+
+func TestClaudePreludeErrorUsesClaudeSSEErrorEvent(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	base := handlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{Streaming: sdkconfig.StreamingConfig{KeepAliveSeconds: 1, PreludeKeepAlive: true}}, nil)
+	handler := NewClaudeCodeAPIHandler(base)
+
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+	flusher, ok := c.Writer.(http.Flusher)
+	if !ok {
+		t.Fatal("expected flusher")
+	}
+	data := make(chan []byte)
+	errs := make(chan *interfaces.ErrorMessage, 1)
+	errs <- &interfaces.ErrorMessage{StatusCode: http.StatusBadGateway, Error: errors.New("claude upstream failed")}
+	close(errs)
+
+	base.HandleStreamPrelude(c, flusher, func(error) {}, data, errs, nil, handlers.StreamPreludeOptions{
+		CommitHeaders: func() {
+			c.Header("Content-Type", "text/event-stream")
+		},
+		WriteFirstChunk: func(chunk []byte) {
+			_, _ = c.Writer.Write(chunk)
+		},
+		WriteClosedBeforeData: func() {},
+		WritePreludeError: func(errMsg *interfaces.ErrorMessage) {
+			status := http.StatusInternalServerError
+			if errMsg != nil && errMsg.StatusCode > 0 {
+				status = errMsg.StatusCode
+			}
+			c.Status(status)
+			errorBytes, _ := json.Marshal(handler.toClaudeError(errMsg))
+			_, _ = fmt.Fprintf(c.Writer, "event: error\ndata: %s\n\n", errorBytes)
+		},
+		Continue: func(data <-chan []byte, errs <-chan *interfaces.ErrorMessage) {
+			handler.forwardClaudeStream(c, flusher, func(error) {}, data, errs)
+		},
+	})
+
+	body := recorder.Body.String()
+	if !strings.Contains(body, "event: error") || !strings.Contains(body, `"type":"error"`) || !strings.Contains(body, "claude upstream failed") {
+		t.Fatalf("expected Claude SSE error event, got %q", body)
 	}
 }

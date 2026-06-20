@@ -59,6 +59,11 @@ type StreamingConfig struct {
 	// <= 0 disables keep-alives. Default is 0.
 	KeepAliveSeconds int `yaml:"keepalive-seconds,omitempty" json:"keepalive-seconds,omitempty"`
 
+	// PreludeKeepAlive controls whether streaming handlers emit SSE heartbeats before the first upstream payload.
+	// When enabled, pre-first-payload errors are returned as SSE error events because response headers are committed.
+	// Default is false.
+	PreludeKeepAlive bool `yaml:"prelude-keepalive,omitempty" json:"prelude-keepalive,omitempty"`
+
 	// BootstrapRetries controls how many times the server may retry a streaming request before any bytes are sent,
 	// to allow auth rotation / transient recovery.
 	// <= 0 disables bootstrap retries. Default is 0.

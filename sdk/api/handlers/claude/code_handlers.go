@@ -237,6 +237,31 @@ func (h *ClaudeCodeAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON [
 		c.Header("Access-Control-Allow-Origin", "*")
 	}
 
+	if h.HandleStreamPrelude(c, flusher, func(err error) { cliCancel(err) }, dataChan, errChan, upstreamHeaders, handlers.StreamPreludeOptions{
+		CommitHeaders: func() {
+			setSSEHeaders()
+			handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
+		},
+		WriteFirstChunk: func(chunk []byte) {
+			_, _ = c.Writer.Write(chunk)
+		},
+		WriteClosedBeforeData: func() {},
+		WritePreludeError: func(errMsg *interfaces.ErrorMessage) {
+			status := http.StatusInternalServerError
+			if errMsg != nil && errMsg.StatusCode > 0 {
+				status = errMsg.StatusCode
+			}
+			c.Status(status)
+			errorBytes, _ := json.Marshal(h.toClaudeError(errMsg))
+			_, _ = fmt.Fprintf(c.Writer, "event: error\ndata: %s\n\n", errorBytes)
+		},
+		Continue: func(data <-chan []byte, errs <-chan *interfaces.ErrorMessage) {
+			h.forwardClaudeStream(c, flusher, func(err error) { cliCancel(err) }, data, errs)
+		},
+	}) {
+		return
+	}
+
 	// Peek at the first chunk to determine success or failure before setting headers
 	for {
 		select {
