@@ -2,6 +2,7 @@ package test
 
 import (
 	"bytes"
+	"strings"
 	"testing"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/toolemu"
@@ -35,19 +36,21 @@ func TestToolEmuFoldPrefixStableAcrossUserMessage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("fold p2: %v", err)
 	}
-	// The system prompt is prepended at messages[0]; compare the decoded text to
-	// verify the injected system content is identical across user-message variants.
+	// The injected prompt is prepended to the first user message; compare the
+	// injected prefix across user-message variants to verify cache stability.
 	sysA := gjson.GetBytes(a, "messages.0.content").String()
 	sysB := gjson.GetBytes(b, "messages.0.content").String()
 	if sysA == "" || sysB == "" {
 		t.Fatalf("messages.0.content empty: A=%q B=%q", sysA, sysB)
 	}
-	if sysA != sysB {
-		t.Fatalf("injected system prompt differs across user-message variants — prefix not cache-stable\nA=%q\nB=%q", sysA, sysB)
+	prefixA := strings.TrimSuffix(sysA, "hello")
+	prefixB := strings.TrimSuffix(sysB, "a different question that is much longer")
+	if prefixA != prefixB {
+		t.Fatalf("injected user prefix differs across user-message variants — prefix not cache-stable\nA=%q\nB=%q", prefixA, prefixB)
 	}
 	// Sanity: the injected content carries the tool_protocol sentinel.
-	if !bytes.Contains([]byte(sysA), []byte("<tool_protocol>")) {
-		t.Fatalf("injected system prompt missing tool_protocol marker: %q", sysA)
+	if !bytes.Contains([]byte(prefixA), []byte("<tool_protocol>")) {
+		t.Fatalf("injected user prefix missing tool_protocol marker: %q", prefixA)
 	}
 }
 
@@ -64,8 +67,8 @@ func TestToolEmuFoldResponsesDeterministic(t *testing.T) {
 	if !bytes.Equal(a, b) {
 		t.Fatalf("non-deterministic fold output:\nA=%s\nB=%s", string(a), string(b))
 	}
-	if got := gjson.GetBytes(a, "instructions").String(); !bytes.Contains([]byte(got), []byte("<tool_protocol>")) {
-		t.Fatalf("instructions missing tool_protocol marker: %q", got)
+	if got := gjson.GetBytes(a, "input.0.content.0.text").String(); !bytes.Contains([]byte(got), []byte("<tool_protocol>")) {
+		t.Fatalf("first user input part missing tool_protocol marker: %q", got)
 	}
 }
 

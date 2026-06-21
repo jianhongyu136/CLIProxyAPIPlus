@@ -237,22 +237,44 @@ func TestStreamParser_UTF8Boundary(t *testing.T) {
 	}
 }
 
-func TestStreamParser_ToolCallStartEmitsBeforeArgumentsComplete(t *testing.T) {
+func TestStreamParser_DoesNotEmitToolCallBeforeArgumentsComplete(t *testing.T) {
 	spy := &spyEvents{}
 	p := NewStreamParser(spy.events(), UpstreamMeta{ResponseID: "r", Provider: "p", Model: "m"})
 
 	p.Feed(`<tool_call>{"name":"f","arguments":{"x":`)
-	if len(spy.toolStarts) != 1 || spy.toolStarts[0].name != "f" {
-		t.Fatalf("tool start not emitted incrementally: %+v", spy.toolStarts)
+	if len(spy.toolStarts) != 0 {
+		t.Fatalf("tool start should wait for complete validated JSON, starts=%+v", spy.toolStarts)
 	}
-	if len(spy.toolEnds) != 0 {
-		t.Fatalf("tool end should wait for complete object, got %+v", spy.toolEnds)
+	if len(spy.argsDeltas) != 0 {
+		t.Fatalf("args deltas should wait for complete validated JSON, deltas=%+v", spy.argsDeltas)
 	}
 
 	p.Feed(`1}}</tool_call>`)
-	p.Close()
+	if len(spy.toolStarts) != 1 || spy.toolStarts[0].name != "f" {
+		t.Fatalf("tool start after completion = %+v", spy.toolStarts)
+	}
 	if spy.allArgs(0) != `{"x":1}` {
-		t.Fatalf("got args %q", spy.allArgs(0))
+		t.Fatalf("args = %q, want {\"x\":1}", spy.allArgs(0))
+	}
+	if len(spy.toolEnds) != 1 || spy.toolEnds[0] != 0 {
+		t.Fatalf("tool end = %+v, want [0]", spy.toolEnds)
+	}
+}
+
+func TestStreamParser_MalformedAfterArgumentsStartEmitsNoTool(t *testing.T) {
+	spy := &spyEvents{}
+	p := NewStreamParser(spy.events(), UpstreamMeta{ResponseID: "r", Provider: "p", Model: "m"})
+
+	p.Feed(`<tool_call>{"name":"f","arguments":{"x":1},"extra":`)
+	p.Close()
+	if len(spy.toolStarts) != 0 {
+		t.Fatalf("malformed incomplete tool call must not emit a tool start: %+v", spy.toolStarts)
+	}
+	if len(spy.argsDeltas) != 0 {
+		t.Fatalf("malformed incomplete tool call must not emit args: %+v", spy.argsDeltas)
+	}
+	if !strings.Contains(spy.allProse(), `<tool_call>`) {
+		t.Fatalf("malformed call should degrade to prose, got %q", spy.allProse())
 	}
 }
 

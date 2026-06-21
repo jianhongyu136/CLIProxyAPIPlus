@@ -27,7 +27,7 @@ func TestToolEmuChatRoundTrip(t *testing.T) {
 		t.Fatalf("RunToolEmu: %v", err)
 	}
 	if got := gjson.GetBytes(outcome.Folded, "messages.0.content").String(); !strings.Contains(got, "<tool_protocol>") {
-		t.Fatalf("folded system content missing tool_protocol marker: %q", got)
+		t.Fatalf("folded first user content missing tool_protocol marker: %q", got)
 	}
 	if bytes.Contains(outcome.Folded, []byte(`"tools":[`)) {
 		t.Fatalf("folded still contains tools array: %s", string(outcome.Folded))

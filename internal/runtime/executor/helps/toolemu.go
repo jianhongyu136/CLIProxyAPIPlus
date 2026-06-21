@@ -94,6 +94,10 @@ func RunToolEmuStream(ctx context.Context, meta toolemu.UpstreamMeta, shape tool
 		emitter := toolemu.NewResponsesStreamEmitter(meta, onFrame)
 		emitter.SetToolChoice(choice)
 		events = emitter.Events()
+	case toolemu.ShapeClaudeMessages:
+		emitter := toolemu.NewClaudeStreamEmitter(meta, onFrame)
+		emitter.SetToolChoice(choice)
+		events = emitter.Events()
 	default:
 		return toolemu.UpstreamMeta{}, fmt.Errorf("toolemu stream: unsupported shape %d", shape)
 	}

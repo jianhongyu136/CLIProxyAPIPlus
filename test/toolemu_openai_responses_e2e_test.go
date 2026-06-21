@@ -22,8 +22,8 @@ func TestToolEmuResponsesRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RunToolEmu: %v", err)
 	}
-	if got := gjson.GetBytes(outcome.Folded, "instructions").String(); !bytes.Contains([]byte(got), []byte("<tool_protocol>")) {
-		t.Fatalf("folded instructions missing tool_protocol marker: %q", got)
+	if got := gjson.GetBytes(outcome.Folded, "input.0.content.0.text").String(); !bytes.Contains([]byte(got), []byte("<tool_protocol>")) {
+		t.Fatalf("folded first user input part missing tool_protocol marker: %q", got)
 	}
 	if bytes.Contains(outcome.Folded, []byte(`"tools":[`)) {
 		t.Fatalf("folded still contains tools array: %s", string(outcome.Folded))

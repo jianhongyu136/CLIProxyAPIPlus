@@ -70,76 +70,11 @@ func foldChat(payload []byte) ([]byte, error) {
 
 	if len(tools) > 0 {
 		injection := RenderInjection(tools, choice)
-
-		sysIdx := -1
-		messages.ForEach(func(idx, msg gjson.Result) bool {
-			if msg.Get("role").String() == "system" {
-				sysIdx = int(idx.Int())
-				return false
-			}
-			return true
-		})
-
-		if sysIdx >= 0 {
-			path := fmt.Sprintf("messages.%d.content", sysIdx)
-			existing := gjson.GetBytes(out, path)
-			if existing.IsArray() {
-				// OpenAI multimodal content: append a new text part instead of
-				// collapsing the parts array into a JSON-encoded string.
-				var parts []json.RawMessage
-				if err := json.Unmarshal([]byte(existing.Raw), &parts); err != nil {
-					return nil, fmt.Errorf("toolemu: parse system content parts: %w", err)
-				}
-				partObj, errPart := marshalSorted(map[string]any{"type": "text", "text": injection})
-				if errPart != nil {
-					return nil, fmt.Errorf("toolemu: marshal injection part: %w", errPart)
-				}
-				items := make([]any, 0, len(parts)+1)
-				for _, p := range parts {
-					items = append(items, p)
-				}
-				items = append(items, json.RawMessage(partObj))
-				merged, errMerge := marshalSorted(items)
-				if errMerge != nil {
-					return nil, fmt.Errorf("toolemu: marshal merged system content: %w", errMerge)
-				}
-				out, _ = sjson.SetRawBytes(out, path, merged)
-			} else {
-				// Plain string content — append injection directly.
-				// Use marshalLeafNoEscape so `<tool_protocol>` and friends remain
-				// literal in the wire bytes. sjson.SetBytes falls back to
-				// encoding/json (with HTML-escape on) for strings containing both a
-				// newline and `<`, which would diverge from the insertion path
-				// below and fragment the upstream prefix cache.
-				raw, errLeaf := marshalLeafNoEscape(existing.String() + "\n" + injection)
-				if errLeaf != nil {
-					return nil, fmt.Errorf("toolemu: marshal injected system content: %w", errLeaf)
-				}
-				out, _ = sjson.SetRawBytes(out, path, raw)
-			}
-		} else {
-			// Insert new system message at index 0. Use marshalSorted so the
-			// resulting wire bytes carry literal `<tool_call>`/`<tool_protocol>`
-			// sentinels instead of HTML-escaped `<...` — this keeps the folded
-			// prefix byte-stable with the existing-system branch above (which
-			// goes through sjson.SetBytes and does not HTML-escape).
-			sys, errSys := marshalSorted(map[string]any{"role": "system", "content": injection})
-			if errSys != nil {
-				return nil, fmt.Errorf("toolemu: marshal injected system message: %w", errSys)
-			}
-			var arr []json.RawMessage
-			_ = json.Unmarshal([]byte(gjson.GetBytes(out, "messages").Raw), &arr)
-			items := make([]any, 0, len(arr)+1)
-			items = append(items, json.RawMessage(sys))
-			for _, e := range arr {
-				items = append(items, json.RawMessage(e))
-			}
-			merged, errMerge := marshalSorted(items)
-			if errMerge != nil {
-				return nil, fmt.Errorf("toolemu: marshal merged messages: %w", errMerge)
-			}
-			out, _ = sjson.SetRawBytes(out, "messages", merged)
+		updated, errInject := prependChatUserInjection(out, injection)
+		if errInject != nil {
+			return nil, errInject
 		}
+		out = updated
 	}
 
 	// Always fold history so historical assistant.tool_calls / role=tool
@@ -164,20 +99,11 @@ func foldResponses(payload []byte) ([]byte, error) {
 
 	if len(tools) > 0 {
 		injection := RenderInjection(tools, choice)
-		existing := gjson.GetBytes(out, "instructions").String()
-		combined := existing
-		if combined != "" {
-			combined += "\n"
+		updated, errInject := prependResponsesUserInjection(out, injection)
+		if errInject != nil {
+			return nil, errInject
 		}
-		combined += injection
-		// Use marshalLeafNoEscape (SetEscapeHTML(false)) so `<tool_protocol>`
-		// and related sentinels stay literal — sjson.SetBytes would fall back
-		// to encoding/json with HTML-escape on for strings containing `\n<`.
-		raw, errLeaf := marshalLeafNoEscape(combined)
-		if errLeaf != nil {
-			return nil, fmt.Errorf("toolemu: marshal injected instructions: %w", errLeaf)
-		}
-		out, _ = sjson.SetRawBytes(out, "instructions", raw)
+		out = updated
 	}
 
 	if input := gjson.GetBytes(out, "input"); input.IsArray() {
@@ -200,7 +126,7 @@ func foldClaude(payload []byte) ([]byte, error) {
 
 	if len(tools) > 0 {
 		injection := RenderInjection(tools, choice)
-		updated, errInject := appendClaudeSystem(out, injection)
+		updated, errInject := prependClaudeUserInjection(out, injection)
 		if errInject != nil {
 			return nil, errInject
 		}
@@ -393,17 +319,18 @@ func parseClaudeToolChoice(v gjson.Result) ToolChoice {
 	if !v.Exists() {
 		return ToolChoiceAuto
 	}
+	disableParallel := v.Get("disable_parallel_tool_use").Bool()
 	switch v.Get("type").String() {
 	case "none":
-		return ToolChoiceNone
+		return ToolChoice{Kind: ToolChoiceKindNone, DisableParallel: disableParallel}
 	case "any":
-		return ToolChoiceRequired
+		return ToolChoice{Kind: ToolChoiceKindRequired, DisableParallel: disableParallel}
 	case "tool":
 		if name := v.Get("name").String(); name != "" {
-			return ToolChoiceNamed(name)
+			return ToolChoice{Kind: ToolChoiceKindNamed, Name: name, DisableParallel: disableParallel}
 		}
 	}
-	return ToolChoiceAuto
+	return ToolChoice{Kind: ToolChoiceKindAuto, DisableParallel: disableParallel}
 }
 
 func parseGeminiToolChoice(v gjson.Result) ToolChoice {
@@ -426,27 +353,319 @@ func parseGeminiToolChoice(v gjson.Result) ToolChoice {
 	return ToolChoiceAuto
 }
 
-func appendClaudeSystem(payload []byte, injection string) ([]byte, error) {
-	system := gjson.GetBytes(payload, "system")
-	if system.IsArray() {
-		part, err := marshalSorted(map[string]any{"type": "text", "text": injection})
-		if err != nil {
-			return nil, fmt.Errorf("toolemu: marshal Claude system injection: %w", err)
+func prependChatUserInjection(payload []byte, injection string) ([]byte, error) {
+	messages := gjson.GetBytes(payload, "messages")
+	if !messages.IsArray() {
+		return payload, nil
+	}
+
+	var raw []json.RawMessage
+	if err := json.Unmarshal([]byte(messages.Raw), &raw); err != nil {
+		return nil, fmt.Errorf("toolemu: parse chat messages: %w", err)
+	}
+
+	userIdx := -1
+	for i, msg := range raw {
+		if gjson.GetBytes(msg, "role").String() == "user" {
+			userIdx = i
+			break
 		}
-		out, _ := sjson.SetRawBytes(payload, "system.-1", part)
+	}
+
+	items := make([]any, 0, len(raw)+1)
+	if userIdx < 0 {
+		insertIdx := 0
+		for insertIdx < len(raw) && gjson.GetBytes(raw[insertIdx], "role").String() == "system" {
+			insertIdx++
+		}
+		userMsg, err := marshalSorted(map[string]any{"role": "user", "content": injection})
+		if err != nil {
+			return nil, fmt.Errorf("toolemu: marshal injected chat user message: %w", err)
+		}
+		for i, msg := range raw {
+			if i == insertIdx {
+				items = append(items, json.RawMessage(userMsg))
+			}
+			items = append(items, json.RawMessage(msg))
+		}
+		if insertIdx == len(raw) {
+			items = append(items, json.RawMessage(userMsg))
+		}
+		merged, err := marshalSorted(items)
+		if err != nil {
+			return nil, fmt.Errorf("toolemu: marshal chat messages with injected user: %w", err)
+		}
+		out, _ := sjson.SetRawBytes(payload, "messages", merged)
 		return out, nil
 	}
-	combined := system.String()
-	if combined != "" {
-		combined += "\n"
-	}
-	combined += injection
-	raw, err := marshalLeafNoEscape(combined)
+
+	rebuiltUser, err := prependChatMessageContent(raw[userIdx], injection)
 	if err != nil {
-		return nil, fmt.Errorf("toolemu: marshal Claude system: %w", err)
+		return nil, err
 	}
-	out, _ := sjson.SetRawBytes(payload, "system", raw)
+	for i, msg := range raw {
+		if i == userIdx {
+			items = append(items, json.RawMessage(rebuiltUser))
+			continue
+		}
+		items = append(items, json.RawMessage(msg))
+	}
+	merged, err := marshalSorted(items)
+	if err != nil {
+		return nil, fmt.Errorf("toolemu: marshal chat messages after user injection: %w", err)
+	}
+	out, _ := sjson.SetRawBytes(payload, "messages", merged)
 	return out, nil
+}
+
+func prependChatMessageContent(orig json.RawMessage, injection string) ([]byte, error) {
+	var obj map[string]any
+	if err := json.Unmarshal(orig, &obj); err != nil {
+		return nil, fmt.Errorf("toolemu: parse chat message: %w", err)
+	}
+
+	content := gjson.GetBytes(orig, "content")
+	switch {
+	case content.IsArray():
+		parts := []any{map[string]any{"type": "text", "text": injection}}
+		content.ForEach(func(_, existing gjson.Result) bool {
+			parts = append(parts, json.RawMessage(existing.Raw))
+			return true
+		})
+		obj["content"] = parts
+	case content.Exists() && content.Type == gjson.String:
+		combined := injection
+		if existing := content.String(); existing != "" {
+			combined += "\n" + existing
+		}
+		obj["content"] = combined
+	case content.Exists() && content.Raw != "null":
+		obj["content"] = []any{map[string]any{"type": "text", "text": injection}, json.RawMessage(content.Raw)}
+	default:
+		obj["content"] = injection
+	}
+	out, err := marshalSorted(obj)
+	if err != nil {
+		return nil, fmt.Errorf("toolemu: marshal chat message content: %w", err)
+	}
+	return out, nil
+}
+
+func prependResponsesUserInjection(payload []byte, injection string) ([]byte, error) {
+	input := gjson.GetBytes(payload, "input")
+	if !input.IsArray() {
+		return payload, nil
+	}
+
+	var raw []json.RawMessage
+	if err := json.Unmarshal([]byte(input.Raw), &raw); err != nil {
+		return nil, fmt.Errorf("toolemu: parse responses input: %w", err)
+	}
+
+	userIdx := -1
+	for i, item := range raw {
+		if gjson.GetBytes(item, "type").String() == "message" && gjson.GetBytes(item, "role").String() == "user" {
+			userIdx = i
+			break
+		}
+	}
+
+	items := make([]any, 0, len(raw)+1)
+	if userIdx < 0 {
+		userMsg, err := marshalSorted(map[string]any{
+			"type":    "message",
+			"role":    "user",
+			"content": []any{map[string]any{"type": "input_text", "text": injection}},
+		})
+		if err != nil {
+			return nil, fmt.Errorf("toolemu: marshal injected responses user message: %w", err)
+		}
+		items = append(items, json.RawMessage(userMsg))
+		for _, item := range raw {
+			items = append(items, json.RawMessage(item))
+		}
+		merged, err := marshalSorted(items)
+		if err != nil {
+			return nil, fmt.Errorf("toolemu: marshal responses input with injected user: %w", err)
+		}
+		out, _ := sjson.SetRawBytes(payload, "input", merged)
+		return out, nil
+	}
+
+	rebuiltUser, err := prependResponsesInputContent(raw[userIdx], injection)
+	if err != nil {
+		return nil, err
+	}
+	for i, item := range raw {
+		if i == userIdx {
+			items = append(items, json.RawMessage(rebuiltUser))
+			continue
+		}
+		items = append(items, json.RawMessage(item))
+	}
+	merged, err := marshalSorted(items)
+	if err != nil {
+		return nil, fmt.Errorf("toolemu: marshal responses input after user injection: %w", err)
+	}
+	out, _ := sjson.SetRawBytes(payload, "input", merged)
+	return out, nil
+}
+
+func prependResponsesInputContent(orig json.RawMessage, injection string) ([]byte, error) {
+	var obj map[string]any
+	if err := json.Unmarshal(orig, &obj); err != nil {
+		return nil, fmt.Errorf("toolemu: parse responses user message: %w", err)
+	}
+
+	content := gjson.GetBytes(orig, "content")
+	injectionPart := map[string]any{"type": "input_text", "text": injection}
+	switch {
+	case content.IsArray():
+		parts := []any{injectionPart}
+		content.ForEach(func(_, existing gjson.Result) bool {
+			parts = append(parts, json.RawMessage(existing.Raw))
+			return true
+		})
+		obj["content"] = parts
+	case content.Exists() && content.Type == gjson.String:
+		parts := []any{injectionPart}
+		if existing := content.String(); existing != "" {
+			parts = append(parts, map[string]any{"type": "input_text", "text": existing})
+		}
+		obj["content"] = parts
+	case content.Exists() && content.Raw != "null":
+		obj["content"] = []any{injectionPart, json.RawMessage(content.Raw)}
+	default:
+		obj["content"] = []any{injectionPart}
+	}
+	out, err := marshalSorted(obj)
+	if err != nil {
+		return nil, fmt.Errorf("toolemu: marshal responses user content: %w", err)
+	}
+	return out, nil
+}
+
+func prependClaudeUserInjection(payload []byte, injection string) ([]byte, error) {
+	messages := gjson.GetBytes(payload, "messages")
+	if !messages.IsArray() {
+		return payload, nil
+	}
+
+	var raw []json.RawMessage
+	if err := json.Unmarshal([]byte(messages.Raw), &raw); err != nil {
+		return nil, fmt.Errorf("toolemu: parse Claude messages: %w", err)
+	}
+
+	userIdx := -1
+	for i, msg := range raw {
+		if gjson.GetBytes(msg, "role").String() == "user" {
+			userIdx = i
+			break
+		}
+	}
+
+	// Attach an Anthropic cache_control breakpoint to the injected tool-protocol
+	// block. After folding, native `tools` are stripped (dropping any tools-level
+	// cache_control) and this injection becomes the largest byte-stable prefix in
+	// the request. Without a breakpoint here the upstream never creates a prefix
+	// cache for single-turn requests, since the executor's message-level
+	// cache_control only targets the second-to-last user turn. Pinning the
+	// breakpoint to the injection block lets the static protocol prefix be cached
+	// independent of conversation turn count.
+	//
+	// Skip the breakpoint when the target user message already carries a
+	// cache_control on one of its existing content parts: the injection is
+	// prepended as the first part of that same message, so a later breakpoint in
+	// the message already caches the injected prefix. Adding our own would waste
+	// one of Anthropic's four cache_control breakpoints.
+	injectPart := map[string]any{
+		"type": "text",
+		"text": injection,
+	}
+	if userIdx < 0 || !claudeMessageHasCacheControl(raw[userIdx]) {
+		injectPart["cache_control"] = map[string]any{"type": "ephemeral"}
+	}
+	items := make([]any, 0, len(raw)+1)
+	if userIdx < 0 {
+		msg, err := marshalSorted(map[string]any{"role": "user", "content": []any{injectPart}})
+		if err != nil {
+			return nil, fmt.Errorf("toolemu: marshal Claude injected user message: %w", err)
+		}
+		items = append(items, json.RawMessage(msg))
+		for _, msg := range raw {
+			items = append(items, json.RawMessage(msg))
+		}
+		merged, err := marshalSorted(items)
+		if err != nil {
+			return nil, fmt.Errorf("toolemu: marshal Claude messages with injected user: %w", err)
+		}
+		out, _ := sjson.SetRawBytes(payload, "messages", merged)
+		return out, nil
+	}
+
+	rebuiltUser, err := prependClaudeTextPart(raw[userIdx], injectPart)
+	if err != nil {
+		return nil, err
+	}
+	for i, msg := range raw {
+		if i == userIdx {
+			items = append(items, json.RawMessage(rebuiltUser))
+			continue
+		}
+		items = append(items, json.RawMessage(msg))
+	}
+	merged, err := marshalSorted(items)
+	if err != nil {
+		return nil, fmt.Errorf("toolemu: marshal Claude messages after user injection: %w", err)
+	}
+	out, _ := sjson.SetRawBytes(payload, "messages", merged)
+	return out, nil
+}
+
+func prependClaudeTextPart(orig json.RawMessage, part map[string]any) ([]byte, error) {
+	var obj map[string]any
+	if err := json.Unmarshal(orig, &obj); err != nil {
+		return nil, fmt.Errorf("toolemu: parse Claude message: %w", err)
+	}
+
+	content := gjson.GetBytes(orig, "content")
+	parts := []any{part}
+	switch {
+	case content.IsArray():
+		content.ForEach(func(_, existing gjson.Result) bool {
+			parts = append(parts, json.RawMessage(existing.Raw))
+			return true
+		})
+	case content.Exists() && content.Type == gjson.String:
+		parts = append(parts, map[string]any{"type": "text", "text": content.String()})
+	case content.Exists() && content.Raw != "null":
+		parts = append(parts, json.RawMessage(content.Raw))
+	}
+	obj["content"] = parts
+	out, err := marshalSorted(obj)
+	if err != nil {
+		return nil, fmt.Errorf("toolemu: marshal Claude message content: %w", err)
+	}
+	return out, nil
+}
+
+// claudeMessageHasCacheControl reports whether a Claude message already carries
+// a cache_control breakpoint on any of its array content parts. String content
+// cannot hold a breakpoint, so it always reports false in that case.
+func claudeMessageHasCacheControl(msg json.RawMessage) bool {
+	content := gjson.GetBytes(msg, "content")
+	if !content.IsArray() {
+		return false
+	}
+	found := false
+	content.ForEach(func(_, part gjson.Result) bool {
+		if part.Get("cache_control").Exists() {
+			found = true
+			return false
+		}
+		return true
+	})
+	return found
 }
 
 func FoldClaudeMessages(messages []byte) ([]byte, error) {
@@ -458,12 +677,15 @@ func FoldClaudeMessages(messages []byte) ([]byte, error) {
 		return nil, err
 	}
 	out := make([]any, 0, len(raw))
+	callIndexByID := map[string]int{}
+	nextCallIndex := 0
+	orphanResultIndex := 0
 	for _, msg := range raw {
 		role := gjson.GetBytes(msg, "role").String()
 		content := gjson.GetBytes(msg, "content")
 		switch role {
 		case "assistant":
-			parts, changed := foldClaudeAssistantParts(content)
+			parts, changed := foldClaudeAssistantParts(content, callIndexByID, &nextCallIndex)
 			if !changed {
 				out = append(out, msg)
 				continue
@@ -474,7 +696,7 @@ func FoldClaudeMessages(messages []byte) ([]byte, error) {
 			}
 			out = append(out, json.RawMessage(rebuilt))
 		case "user":
-			parts, changed := foldClaudeUserParts(content)
+			parts, changed := foldClaudeUserParts(content, callIndexByID, &orphanResultIndex)
 			if !changed {
 				out = append(out, msg)
 				continue
@@ -491,7 +713,7 @@ func FoldClaudeMessages(messages []byte) ([]byte, error) {
 	return marshalSorted(out)
 }
 
-func foldClaudeAssistantParts(content gjson.Result) ([]any, bool) {
+func foldClaudeAssistantParts(content gjson.Result, callIndexByID map[string]int, nextCallIndex *int) ([]any, bool) {
 	if content.Type == gjson.String || !content.IsArray() {
 		return nil, false
 	}
@@ -502,8 +724,13 @@ func foldClaudeAssistantParts(content gjson.Result) ([]any, bool) {
 			parts = append(parts, json.RawMessage(part.Raw))
 			return true
 		}
+		idx := *nextCallIndex
+		*nextCallIndex = *nextCallIndex + 1
+		if id := part.Get("id").String(); id != "" {
+			callIndexByID[id] = idx
+		}
 		obj := map[string]any{
-			"id":        part.Get("id").String(),
+			"index":     idx,
 			"name":      part.Get("name").String(),
 			"arguments": json.RawMessage(canonicalJSON(json.RawMessage(part.Get("input").Raw))),
 		}
@@ -515,7 +742,7 @@ func foldClaudeAssistantParts(content gjson.Result) ([]any, bool) {
 	return parts, changed
 }
 
-func foldClaudeUserParts(content gjson.Result) ([]any, bool) {
+func foldClaudeUserParts(content gjson.Result, callIndexByID map[string]int, orphanResultIndex *int) ([]any, bool) {
 	if !content.IsArray() {
 		return nil, false
 	}
@@ -526,7 +753,12 @@ func foldClaudeUserParts(content gjson.Result) ([]any, bool) {
 			parts = append(parts, json.RawMessage(part.Raw))
 			return true
 		}
-		text := fmt.Sprintf("<tool_result tool_call_id=%q>%s</tool_result>", part.Get("tool_use_id").String(), part.Get("content").String())
+		idx, ok := callIndexByID[part.Get("tool_use_id").String()]
+		if !ok {
+			idx = *orphanResultIndex
+			*orphanResultIndex = *orphanResultIndex + 1
+		}
+		text := fmt.Sprintf("<tool_result index=%q>%s</tool_result>", fmt.Sprintf("%d", idx), part.Get("content").String())
 		parts = append(parts, map[string]any{"type": "text", "text": text})
 		changed = true
 		return true

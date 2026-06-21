@@ -152,7 +152,7 @@ func TestParseAndRetry_ResponsesShape(t *testing.T) {
 	}
 }
 
-func TestParseAndRetry_ToolChoiceRequiredRetriesThenDegrades(t *testing.T) {
+func TestParseAndRetry_ToolChoiceRequiredRetriesThenReturnsValidationError(t *testing.T) {
 	payload := []byte(`{"messages":[{"role":"user","content":"hi"}]}`)
 	calls := 0
 	send := func(_ context.Context, _ []byte) ([]byte, error) {
@@ -160,15 +160,43 @@ func TestParseAndRetry_ToolChoiceRequiredRetriesThenDegrades(t *testing.T) {
 		return newChatBody("plain answer"), nil
 	}
 
-	res, err := ParseAndRetry(context.Background(), payload, send, ShapeOpenAIChat, RetryPolicy{Attempts: 1, OnFailure: "parse_failed_to_content"}, ToolChoiceRequired)
-	if err != nil {
-		t.Fatal(err)
+	_, err := ParseAndRetry(context.Background(), payload, send, ShapeOpenAIChat, RetryPolicy{Attempts: 1, OnFailure: "parse_failed_to_content"}, ToolChoiceRequired)
+	if err == nil {
+		t.Fatal("expected tool_choice validation error")
 	}
 	if calls != 2 {
 		t.Fatalf("send calls = %d, want 2", calls)
 	}
-	if !res.Degraded || res.Parsed.Prose != "plain answer" {
-		t.Fatalf("unexpected result: %+v", res)
+	if !strings.Contains(err.Error(), "tool_choice required") {
+		t.Fatalf("error = %v, want required violation", err)
+	}
+}
+
+func TestParseAndRetry_ToolChoiceViolationReturnsError(t *testing.T) {
+	payload := []byte(`{"messages":[{"role":"user","content":"hi"}]}`)
+	send := func(_ context.Context, _ []byte) ([]byte, error) {
+		return []byte(`{"id":"msg_1","model":"m","content":[{"type":"text","text":"I will answer directly"}]}`), nil
+	}
+	_, err := ParseAndRetry(context.Background(), payload, send, ShapeClaudeMessages, RetryPolicy{Attempts: 0, OnFailure: "parse_failed_to_content"}, ToolChoiceRequired)
+	if err == nil {
+		t.Fatal("expected tool_choice validation error")
+	}
+	if !strings.Contains(err.Error(), "tool_choice required") {
+		t.Fatalf("error = %v, want required violation", err)
+	}
+}
+
+func TestValidateToolChoice_DisableParallelRejectsMultipleCalls(t *testing.T) {
+	parsed := Parsed{ToolCalls: []ParsedToolCall{
+		{Name: "first", Arguments: []byte(`{}`)},
+		{Name: "second", Arguments: []byte(`{}`)},
+	}}
+	err := ValidateToolChoice(parsed, ToolChoice{Kind: ToolChoiceKindRequired, DisableParallel: true})
+	if err == nil {
+		t.Fatal("expected disable_parallel violation")
+	}
+	if !strings.Contains(err.Error(), "parallel") {
+		t.Fatalf("error = %v, want parallel violation", err)
 	}
 }
 
@@ -180,11 +208,11 @@ func TestParseAndRetry_ToolChoiceNamedRejectsWrongTool(t *testing.T) {
 
 	_, err := ParseAndRetry(context.Background(), payload, send, ShapeOpenAIChat, RetryPolicy{Attempts: 0, OnFailure: "error"}, ToolChoiceNamed("expected"))
 	if err == nil {
-		t.Fatal("expected ParseFailedError")
+		t.Fatal("expected tool_choice validation error")
 	}
-	var pfe ParseFailedError
-	if !errors.As(err, &pfe) {
-		t.Fatalf("expected ParseFailedError, got %T: %v", err, err)
+	var validationErr ToolChoiceValidationError
+	if !errors.As(err, &validationErr) {
+		t.Fatalf("expected ToolChoiceValidationError, got %T: %v", err, err)
 	}
 }
 
@@ -196,6 +224,10 @@ func TestParseAndRetry_ToolChoiceNoneRejectsToolCall(t *testing.T) {
 
 	_, err := ParseAndRetry(context.Background(), payload, send, ShapeOpenAIChat, RetryPolicy{Attempts: 0, OnFailure: "error"}, ToolChoiceNone)
 	if err == nil {
-		t.Fatal("expected ParseFailedError")
+		t.Fatal("expected tool_choice validation error")
+	}
+	var validationErr ToolChoiceValidationError
+	if !errors.As(err, &validationErr) {
+		t.Fatalf("expected ToolChoiceValidationError, got %T: %v", err, err)
 	}
 }

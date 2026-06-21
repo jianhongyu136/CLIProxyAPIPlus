@@ -211,14 +211,12 @@ func (p *StreamParser) resetInCallState() {
 }
 
 func (p *StreamParser) feedInCall(r rune) {
-	// Skip leading whitespace before JSON object
+	// Skip leading whitespace before JSON object.
 	if p.jsonDepth == 0 && !p.inStr && isASCIISpace(byte(r)) {
 		return
 	}
 
 	p.headBuf.WriteRune(r)
-	p.maybeStartToolCall()
-	p.feedArgumentRune(r)
 
 	if p.inStr {
 		if p.escape {

@@ -123,6 +123,26 @@ func TestParseClaudeUsageFallsBackCachedTokensToCacheCreation(t *testing.T) {
 	}
 }
 
+func TestParseClaudeUsageAcceptsRawUsageObject(t *testing.T) {
+	data := []byte(`{"input_tokens":3,"output_tokens":5,"cache_read_input_tokens":7,"cache_creation_input_tokens":11}`)
+	detail := ParseClaudeUsage(data)
+	if detail.InputTokens != 3 {
+		t.Fatalf("input tokens = %d, want 3", detail.InputTokens)
+	}
+	if detail.OutputTokens != 5 {
+		t.Fatalf("output tokens = %d, want 5", detail.OutputTokens)
+	}
+	if detail.CacheReadTokens != 7 {
+		t.Fatalf("cache read tokens = %d, want 7", detail.CacheReadTokens)
+	}
+	if detail.CacheCreationTokens != 11 {
+		t.Fatalf("cache creation tokens = %d, want 11", detail.CacheCreationTokens)
+	}
+	if detail.TotalTokens != 26 {
+		t.Fatalf("total tokens = %d, want 26", detail.TotalTokens)
+	}
+}
+
 func TestParseGeminiCLIUsage_TopLevelUsageMetadata(t *testing.T) {
 	data := []byte(`{"usageMetadata":{"promptTokenCount":11,"candidatesTokenCount":7,"thoughtsTokenCount":3,"totalTokenCount":21,"cachedContentTokenCount":5}}`)
 	detail := ParseGeminiCLIUsage(data)

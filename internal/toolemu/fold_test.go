@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/tidwall/gjson"
@@ -14,7 +15,7 @@ func startsWith(s, prefix string) bool {
 	return len(s) >= len(prefix) && s[:len(prefix)] == prefix
 }
 
-func TestFoldRequest_ChatStripsToolsAndAppendsToSystem(t *testing.T) {
+func TestFoldRequest_ChatStripsToolsAndPrependsToFirstUser(t *testing.T) {
 	payload := []byte(`{
 		"model": "m",
 		"messages": [
@@ -32,16 +33,19 @@ func TestFoldRequest_ChatStripsToolsAndAppendsToSystem(t *testing.T) {
 	if gjson.GetBytes(out, "tools").Exists() {
 		t.Fatalf("tools must be removed:\n%s", out)
 	}
-	sys := gjson.GetBytes(out, "messages.0.content").String()
-	if !contains(sys, "<tools_doc>") || !contains(sys, "<tool_protocol>") {
-		t.Fatalf("system content missing injection:\n%s", sys)
+	if got := gjson.GetBytes(out, "messages.0.content").String(); got != "You are X." {
+		t.Fatalf("system content should remain unchanged, got %q", got)
 	}
-	if !startsWith(sys, "You are X.") {
-		t.Fatalf("original system content must remain at the start:\n%s", sys)
+	firstUser := gjson.GetBytes(out, "messages.1.content").String()
+	if !contains(firstUser, "<tools_doc>") || !contains(firstUser, "<tool_protocol>") {
+		t.Fatalf("first user content missing injection:\n%s", firstUser)
+	}
+	if !strings.HasSuffix(firstUser, "hi") {
+		t.Fatalf("original user content must remain after injection:\n%s", firstUser)
 	}
 }
 
-func TestFoldRequest_ChatCreatesSystemWhenAbsent(t *testing.T) {
+func TestFoldRequest_ChatPrependsToFirstUserWhenSystemAbsent(t *testing.T) {
 	payload := []byte(`{
 		"model": "m",
 		"messages": [{"role":"user","content":"hi"}],
@@ -49,8 +53,12 @@ func TestFoldRequest_ChatCreatesSystemWhenAbsent(t *testing.T) {
 	}`)
 	out, _ := FoldRequest(payload, FoldOpts{Shape: ShapeOpenAIChat})
 	firstRole := gjson.GetBytes(out, "messages.0.role").String()
-	if firstRole != "system" {
-		t.Fatalf("expected system message at index 0, got %q\n%s", firstRole, out)
+	if firstRole != "user" {
+		t.Fatalf("expected user message at index 0, got %q\n%s", firstRole, out)
+	}
+	firstContent := gjson.GetBytes(out, "messages.0.content").String()
+	if !contains(firstContent, "<tools_doc>") || !contains(firstContent, "<tool_protocol>") {
+		t.Fatalf("first user content missing injection:\n%s", firstContent)
 	}
 }
 
@@ -79,7 +87,7 @@ func TestFoldRequest_ByteIdenticalForSameInput(t *testing.T) {
 	}
 }
 
-func TestFoldRequest_ResponsesStripsToolsAndAppendsInstructions(t *testing.T) {
+func TestFoldRequest_ResponsesStripsToolsAndPrependsToFirstUser(t *testing.T) {
 	payload := []byte(`{
 		"model":"m",
 		"instructions":"You are X.",
@@ -93,12 +101,15 @@ func TestFoldRequest_ResponsesStripsToolsAndAppendsInstructions(t *testing.T) {
 	if gjson.GetBytes(out, "tools").Exists() {
 		t.Fatalf("tools must be stripped:\n%s", out)
 	}
-	instr := gjson.GetBytes(out, "instructions").String()
-	if !startsWith(instr, "You are X.") {
-		t.Fatalf("original instructions must remain at front:\n%s", instr)
+	if got := gjson.GetBytes(out, "instructions").String(); got != "You are X." {
+		t.Fatalf("instructions should remain unchanged, got %q", got)
 	}
-	if !contains(instr, "<tool_protocol>") {
-		t.Fatalf("missing protocol block:\n%s", instr)
+	firstPart := gjson.GetBytes(out, "input.0.content.0.text").String()
+	if !contains(firstPart, "<tools_doc>") || !contains(firstPart, "<tool_protocol>") {
+		t.Fatalf("first user input part missing injection:\n%s", out)
+	}
+	if got := gjson.GetBytes(out, "input.0.content.1.text").String(); got != "hi" {
+		t.Fatalf("original first user input must remain after injection, got %q", got)
 	}
 }
 
@@ -229,6 +240,30 @@ func TestFoldRequest_ResponsesFoldsHistoryWithoutVolatileToolIDs(t *testing.T) {
 	}
 }
 
+func TestFoldRequest_ClaudeFoldsHistoryWithoutVolatileToolIDs(t *testing.T) {
+	payload := []byte(`{
+		"messages":[
+			{"role":"assistant","content":[{"type":"tool_use","id":"toolu_ephemeral_123","name":"get_weather","input":{"loc":"sf"}}]},
+			{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_ephemeral_123","content":"sunny"}]}
+		]
+	}`)
+	out, err := FoldRequest(payload, FoldOpts{Shape: ShapeClaudeMessages})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(out, []byte("toolu_ephemeral_123")) {
+		t.Fatalf("folded Claude prompt must not contain volatile tool id:\n%s", out)
+	}
+	assistantText := gjson.GetBytes(out, "messages.0.content.0.text").String()
+	resultText := gjson.GetBytes(out, "messages.1.content.0.text").String()
+	if !contains(assistantText, `"index":0`) {
+		t.Fatalf("assistant folded tool_call missing stable index: %s", assistantText)
+	}
+	if resultText != `<tool_result index="0">sunny</tool_result>` {
+		t.Fatalf("tool_result = %q, want stable index result", resultText)
+	}
+}
+
 func TestFoldRequest_ChatFoldsMultipleToolResultsWithStableIndexes(t *testing.T) {
 	payload := []byte(`{
 		"model":"m",
@@ -293,10 +328,7 @@ func TestHasToolArtifacts(t *testing.T) {
 	}
 }
 
-func TestFoldRequest_ChatAppendsToArraySystemContent(t *testing.T) {
-	// Anthropic→OpenAI translation may produce system.content as an array of
-	// text parts (multimodal-style). toolemu must append the injection as a
-	// new text part instead of collapsing the parts into a JSON-encoded string.
+func TestFoldRequest_ChatPrependsToFirstUserArrayContent(t *testing.T) {
 	payload := []byte(`{
 		"model":"m",
 		"messages":[
@@ -304,7 +336,10 @@ func TestFoldRequest_ChatAppendsToArraySystemContent(t *testing.T) {
 				{"type":"text","text":"You are X."},
 				{"type":"text","text":"More guidance."}
 			]},
-			{"role":"user","content":"hi"}
+			{"role":"user","content":[
+				{"type":"text","text":"hi"},
+				{"type":"image_url","image_url":{"url":"https://example.com/cat.png"}}
+			]}
 		],
 		"tools":[{"type":"function","function":{"name":"f","description":"","parameters":{}}}]
 	}`)
@@ -316,20 +351,26 @@ func TestFoldRequest_ChatAppendsToArraySystemContent(t *testing.T) {
 	if !sys.IsArray() {
 		t.Fatalf("system.content must stay as an array, got: %s", sys.Raw)
 	}
-	parts := sys.Array()
+	user := gjson.GetBytes(out, "messages.1.content")
+	if !user.IsArray() {
+		t.Fatalf("user.content must stay as an array, got: %s", user.Raw)
+	}
+	parts := user.Array()
 	if len(parts) != 3 {
-		t.Fatalf("expected 3 parts (2 original + 1 injection), got %d: %s", len(parts), sys.Raw)
+		t.Fatalf("expected 3 parts (1 injection + 2 original), got %d: %s", len(parts), user.Raw)
 	}
-	if parts[0].Get("text").String() != "You are X." {
-		t.Fatalf("first part must preserve original text, got: %s", parts[0].Raw)
+	if parts[0].Get("type").String() != "text" {
+		t.Fatalf("injection part must be type=text, got: %s", parts[0].Raw)
 	}
-	last := parts[2]
-	if last.Get("type").String() != "text" {
-		t.Fatalf("injection part must be type=text, got: %s", last.Raw)
-	}
-	injectedText := last.Get("text").String()
+	injectedText := parts[0].Get("text").String()
 	if !contains(injectedText, "<tools_doc>") || !contains(injectedText, "<tool_protocol>") {
 		t.Fatalf("injection part missing prompt blocks: %s", injectedText)
+	}
+	if parts[1].Get("text").String() != "hi" {
+		t.Fatalf("original first user part must shift to index 1, got: %s", parts[1].Raw)
+	}
+	if parts[2].Get("type").String() != "image_url" {
+		t.Fatalf("original non-text user part must be preserved, got: %s", parts[2].Raw)
 	}
 }
 
@@ -357,8 +398,23 @@ func TestFoldRequest_ClaudeFoldsToolsAndHistory(t *testing.T) {
 		t.Fatalf("tool_choice must be stripped:\n%s", out)
 	}
 	system := gjson.GetBytes(out, "system").String()
-	if !startsWith(system, "You are X.") || !contains(system, "<tools_doc>") || !contains(system, "<tool_protocol>") {
-		t.Fatalf("system missing injection:\n%s", system)
+	if system != "You are X." {
+		t.Fatalf("system should remain unchanged:\n%s", system)
+	}
+	firstUser := gjson.GetBytes(out, "messages.0.content")
+	if !firstUser.IsArray() {
+		t.Fatalf("first user content must be an array with injected prefix: %s", firstUser.Raw)
+	}
+	userParts := firstUser.Array()
+	if len(userParts) < 2 {
+		t.Fatalf("first user content must preserve original text after injection: %s", firstUser.Raw)
+	}
+	injectedText := userParts[0].Get("text").String()
+	if !contains(injectedText, "<tools_doc>") || !contains(injectedText, "<tool_protocol>") {
+		t.Fatalf("first user part missing injection: %s", firstUser.Raw)
+	}
+	if got := userParts[1].Get("text").String(); got != "weather" {
+		t.Fatalf("original user text must remain after injection, got %q", got)
 	}
 	asst := gjson.GetBytes(out, "messages.1.content")
 	if !asst.IsArray() || asst.Array()[0].Get("type").String() != "text" {
@@ -371,6 +427,117 @@ func TestFoldRequest_ClaudeFoldsToolsAndHistory(t *testing.T) {
 	user := gjson.GetBytes(out, "messages.2.content")
 	if !user.IsArray() || !contains(user.Array()[0].Get("text").String(), "<tool_result") {
 		t.Fatalf("tool_result must be folded into user text: %s", user.Raw)
+	}
+}
+
+func TestFoldRequest_ClaudePrependsInjectionToFirstUserArrayContent(t *testing.T) {
+	payload := []byte(`{
+		"messages":[
+			{"role":"user","content":[
+				{"type":"text","text":"hello"},
+				{"type":"image","source":{"type":"base64","media_type":"image/png","data":"abc"}}
+			]},
+			{"role":"assistant","content":"ok"}
+		],
+		"tools":[{"name":"get_weather","description":"weather","input_schema":{"type":"object"}}]
+	}`)
+
+	out, err := FoldRequest(payload, FoldOpts{Shape: ShapeClaudeMessages})
+	if err != nil {
+		t.Fatal(err)
+	}
+	parts := gjson.GetBytes(out, "messages.0.content")
+	if !parts.IsArray() {
+		t.Fatalf("user content must stay an array: %s", parts.Raw)
+	}
+	items := parts.Array()
+	if len(items) != 3 {
+		t.Fatalf("expected 3 user parts (1 injection + 2 original), got %d: %s", len(items), parts.Raw)
+	}
+	if got := items[0].Get("type").String(); got != "text" {
+		t.Fatalf("injection part type = %q, want text: %s", got, items[0].Raw)
+	}
+	if got := items[0].Get("text").String(); !contains(got, "<tools_doc>") || !contains(got, "<tool_protocol>") {
+		t.Fatalf("first user part must carry injection: %s", items[0].Raw)
+	}
+	if got := items[1].Get("text").String(); got != "hello" {
+		t.Fatalf("original first user part should shift to index 1, got %q", got)
+	}
+	if items[2].Get("type").String() != "image" {
+		t.Fatalf("original non-text user part must be preserved: %s", items[2].Raw)
+	}
+}
+
+// TestFoldRequest_ClaudeInjectionCarriesCacheControl locks the prefix-cache
+// contract: after folding, native tools are stripped (dropping any tools-level
+// cache_control), so the injected tool-protocol block becomes the largest
+// byte-stable prefix and MUST carry a cache_control breakpoint of its own.
+// Otherwise single-turn requests never create an upstream prefix cache, since
+// the executor's message-level cache_control only targets the second-to-last
+// user turn (absent on a single-turn request).
+func TestFoldRequest_ClaudeInjectionCarriesCacheControl(t *testing.T) {
+	// Single-turn request: only one user message, no prior turns to cache.
+	payload := []byte(`{
+		"model":"claude-test",
+		"messages":[{"role":"user","content":"weather please"}],
+		"tools":[{"name":"get_weather","description":"weather","input_schema":{"type":"object"}}]
+	}`)
+
+	out, err := FoldRequest(payload, FoldOpts{Shape: ShapeClaudeMessages})
+	if err != nil {
+		t.Fatal(err)
+	}
+	injected := gjson.GetBytes(out, "messages.0.content.0")
+	if !contains(injected.Get("text").String(), "<tool_protocol>") {
+		t.Fatalf("expected injection prepended to first user content: %s", out)
+	}
+	if injected.Get("cache_control.type").String() != "ephemeral" {
+		t.Fatalf("injected tool-protocol block must carry an ephemeral cache_control breakpoint: %s", injected.Raw)
+	}
+	// Only the injection block carries a breakpoint; the original user text must not.
+	if gjson.GetBytes(out, "messages.0.content.1.cache_control").Exists() {
+		t.Fatalf("original user content must not gain a cache_control breakpoint: %s", out)
+	}
+}
+
+// TestFoldRequest_ClaudeInjectionSkipsCacheControlWhenUserAlreadyBreakpointed
+// verifies that when the target user message already carries a cache_control
+// breakpoint on an existing content part, the prepended tool-protocol block
+// does NOT add its own. The injection is prepended into the same message, so
+// the existing later breakpoint already caches the injected prefix; adding a
+// second would waste one of Anthropic's four breakpoints.
+func TestFoldRequest_ClaudeInjectionSkipsCacheControlWhenUserAlreadyBreakpointed(t *testing.T) {
+	payload := []byte(`{
+		"model":"claude-test",
+		"messages":[{"role":"user","content":[{"type":"text","text":"weather please","cache_control":{"type":"ephemeral"}}]}],
+		"tools":[{"name":"get_weather","description":"weather","input_schema":{"type":"object"}}]
+	}`)
+
+	out, err := FoldRequest(payload, FoldOpts{Shape: ShapeClaudeMessages})
+	if err != nil {
+		t.Fatal(err)
+	}
+	injected := gjson.GetBytes(out, "messages.0.content.0")
+	if !contains(injected.Get("text").String(), "<tool_protocol>") {
+		t.Fatalf("expected injection prepended to first user content: %s", out)
+	}
+	// The injection block must NOT carry a breakpoint; the existing user part keeps its own.
+	if injected.Get("cache_control").Exists() {
+		t.Fatalf("injection block must not add a redundant breakpoint when the user message already has one: %s", injected.Raw)
+	}
+	if gjson.GetBytes(out, "messages.0.content.1.cache_control.type").String() != "ephemeral" {
+		t.Fatalf("original user breakpoint must be preserved: %s", out)
+	}
+}
+
+func TestExtractToolChoice_ClaudeDisableParallel(t *testing.T) {
+	payload := []byte(`{"tool_choice":{"type":"any","disable_parallel_tool_use":true}}`)
+	choice := ExtractToolChoice(payload, ShapeClaudeMessages)
+	if choice.Kind != ToolChoiceKindRequired {
+		t.Fatalf("choice kind = %v, want required", choice.Kind)
+	}
+	if !choice.DisableParallel {
+		t.Fatal("DisableParallel = false, want true")
 	}
 }
 

@@ -27,8 +27,9 @@ const (
 
 // ToolChoice is the locked-down tool_choice value used during rendering.
 type ToolChoice struct {
-	Kind ToolChoiceKind
-	Name string // only for Kind == ToolChoiceKindNamed
+	Kind            ToolChoiceKind
+	Name            string // only for Kind == ToolChoiceKindNamed
+	DisableParallel bool
 }
 
 // Convenience constructors.

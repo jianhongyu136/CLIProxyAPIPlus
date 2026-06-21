@@ -204,3 +204,101 @@ func TestUpstreamPump_ContextCancellation(t *testing.T) {
 		t.Fatal("expected context error")
 	}
 }
+
+func TestUpstreamPump_NoSpaceSSEFields(t *testing.T) {
+	sse := strings.Join([]string{
+		`event:response.output_text.delta`,
+		`data:{"type":"response.output_text.delta","delta":"Hi"}`,
+		``,
+		`event:response.completed`,
+		`data:{"type":"response.completed","response":{"id":"resp_1","model":"m","usage":{"input_tokens":1}}}`,
+		``,
+	}, "\n")
+
+	spy := &spyEvents{}
+	parser := NewStreamParser(spy.events(), UpstreamMeta{})
+	pump := &UpstreamPump{Reader: strings.NewReader(sse), Shape: ShapeOpenAIResponses, Parser: parser}
+	meta, err := pump.Run(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := spy.allProse(); got != "Hi" {
+		t.Fatalf("prose = %q, want Hi", got)
+	}
+	if meta.ResponseID != "resp_1" {
+		t.Fatalf("response id = %q, want resp_1", meta.ResponseID)
+	}
+}
+
+func TestUpstreamPump_MultilineDataEvent(t *testing.T) {
+	sse := strings.Join([]string{
+		`event: response.output_text.delta`,
+		`data: {"type":"response.output_text.delta",`,
+		`data: "delta":"Hi"}`,
+		``,
+		`event: response.completed`,
+		`data: {"type":"response.completed","response":{"id":"resp_2","model":"m"}}`,
+		``,
+	}, "\n")
+
+	spy := &spyEvents{}
+	parser := NewStreamParser(spy.events(), UpstreamMeta{})
+	pump := &UpstreamPump{Reader: strings.NewReader(sse), Shape: ShapeOpenAIResponses, Parser: parser}
+	meta, err := pump.Run(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := spy.allProse(); got != "Hi" {
+		t.Fatalf("prose = %q, want Hi", got)
+	}
+	if meta.ResponseID != "resp_2" {
+		t.Fatalf("response id = %q, want resp_2", meta.ResponseID)
+	}
+}
+
+func TestUpstreamPump_ClaudeErrorEventReturnsError(t *testing.T) {
+	sse := strings.Join([]string{
+		`event: error`,
+		`data: {"type":"error","error":{"type":"overloaded_error","message":"overloaded"}}`,
+		``,
+	}, "\n")
+
+	spy := &spyEvents{}
+	parser := NewStreamParser(spy.events(), UpstreamMeta{})
+	pump := &UpstreamPump{Reader: strings.NewReader(sse), Shape: ShapeClaudeMessages, Parser: parser}
+	_, err := pump.Run(context.Background())
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !strings.Contains(err.Error(), "overloaded") {
+		t.Fatalf("error = %v, want overloaded", err)
+	}
+}
+
+func TestUpstreamPump_ClaudePreservesMaxTokensStopReason(t *testing.T) {
+	sse := strings.Join([]string{
+		`event: message_start`,
+		`data: {"type":"message_start","message":{"id":"msg_1","model":"m","usage":{"input_tokens":1}}}`,
+		``,
+		`event: content_block_delta`,
+		`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"partial"}}`,
+		``,
+		`event: message_delta`,
+		`data: {"type":"message_delta","delta":{"stop_reason":"max_tokens"},"usage":{"output_tokens":2}}`,
+		``,
+		`event: message_stop`,
+		`data: {"type":"message_stop"}`,
+		``,
+	}, "\n")
+
+	spy := &spyEvents{}
+	parser := NewStreamParser(spy.events(), UpstreamMeta{})
+	pump := &UpstreamPump{Reader: strings.NewReader(sse), Shape: ShapeClaudeMessages, Parser: parser}
+	meta, err := pump.Run(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if meta.FinishOverride != "max_tokens" {
+		t.Fatalf("finish override = %q, want max_tokens", meta.FinishOverride)
+	}
+}

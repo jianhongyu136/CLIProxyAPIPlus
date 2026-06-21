@@ -39,6 +39,9 @@ type ToolChoiceValidationError struct {
 }
 
 func (e ToolChoiceValidationError) Error() string {
+	if e.Choice.DisableParallel && len(e.Parsed.ToolCalls) > 1 {
+		return "toolemu: tool_choice disable_parallel_tool_use forbids multiple tool calls"
+	}
 	switch e.Choice.Kind {
 	case ToolChoiceKindNone:
 		return "toolemu: tool_choice none forbids tool calls"
@@ -72,6 +75,9 @@ func ValidateToolChoice(parsed Parsed, choice ToolChoice) error {
 			}
 		}
 	}
+	if choice.DisableParallel && len(parsed.ToolCalls) > 1 {
+		return ToolChoiceValidationError{Choice: choice, Parsed: parsed}
+	}
 	return nil
 }
 
@@ -83,6 +89,7 @@ func ParseAndRetry(ctx context.Context, payload []byte, send UpstreamSendFunc, s
 	current := payload
 	var lastText string
 	var lastMeta UpstreamMeta
+	var lastErr error
 	maxAttempts := 1 + policy.Attempts
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		body, err := send(ctx, current)
@@ -98,6 +105,7 @@ func ParseAndRetry(ctx context.Context, payload []byte, send UpstreamSendFunc, s
 		if perr == nil {
 			return ParseResult{Parsed: parsed, Meta: meta}, nil
 		}
+		lastErr = perr
 		if attempt == maxAttempts-1 {
 			break
 		}
@@ -108,6 +116,9 @@ func ParseAndRetry(ctx context.Context, payload []byte, send UpstreamSendFunc, s
 		current = retryPayload
 	}
 
+	if _, ok := lastErr.(ToolChoiceValidationError); ok {
+		return ParseResult{}, lastErr
+	}
 	switch policy.OnFailure {
 	case "error":
 		return ParseResult{}, ParseFailedError{LastText: lastText}
